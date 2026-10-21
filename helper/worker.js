@@ -9,6 +9,9 @@
  *                            then redirects back to the Cadence site with #cadence-helper=<device id>.
  *   POST /token  {sid}     → { access_token, expires_in, scope }      (CORS: the Cadence site only)
  *   POST /logout {sid}     → revokes the Google grant and deletes the stored token
+ *   POST /pair  {pair}     → {sid} once, for the one-time pairing code the app sent to /auth/start?pair=…
+ *                            (iPhone Home Screen apps finish Google sign-in in a separate browser, so the
+ *                            app collects its device id this way instead of from the redirect).
  *
  * Storage (KV namespace bound as TOKENS)
  *   key   "rt:" + hex(SHA-256(sid))
@@ -35,6 +38,7 @@ const STATE_MAX_AGE_MS = 10 * 60 * 1000;
 const KV_TTL_SEC = 8 * 24 * 3600;
 const NONCE_COOKIE = "cadence_nonce";
 const SID_RE = /^[A-Za-z0-9_-]{43}$/;
+const PAIR_TTL_SEC = 15 * 60;
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -143,6 +147,9 @@ async function writeStored(env, sid, refreshToken, scope, created) {
   const ageSec = Math.floor((Date.now() - rec.created) / 1000);
   await env.TOKENS.put(await kvKey(sid), JSON.stringify(rec), { expirationTtl: Math.max(60, KV_TTL_SEC - ageSec) });
 }
+async function pairKey(pair) {
+  return "pair:" + hex(await crypto.subtle.digest("SHA-256", enc.encode(pair)));
+}
 async function readSid(req) {
   let body = null;
   try {
@@ -157,7 +164,10 @@ async function readSid(req) {
 /* ---------- routes ---------- */
 async function authStart(req, env, url) {
   const nonce = b64url(randomBytes(16));
-  const payload = b64url(enc.encode(JSON.stringify({ v: 1, n: nonce, t: Date.now() })));
+  const pairIn = url.searchParams.get("pair");
+  const st = { v: 1, n: nonce, t: Date.now() };
+  if (pairIn && SID_RE.test(pairIn)) st.p = pairIn;
+  const payload = b64url(enc.encode(JSON.stringify(st)));
   const sig = b64url(await crypto.subtle.sign("HMAC", await stateKey(env), enc.encode(payload)));
   const q = new URLSearchParams({
     client_id: env.GOOGLE_CLIENT_ID,
@@ -214,6 +224,12 @@ async function authCallback(req, env, url) {
 
   const sid = b64url(randomBytes(32));
   await writeStored(env, sid, r.data.refresh_token, r.data.scope, Date.now());
+  if (typeof st.p === "string" && SID_RE.test(st.p)) {
+    // hand the device id to the app that started sign-in (encrypted under its pairing code, short-lived)
+    const iv = randomBytes(12);
+    const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await hkdfKey(unb64url(st.p), "cadence-helper-v1", "pairing", "aes"), enc.encode(sid));
+    await env.TOKENS.put(await pairKey(st.p), JSON.stringify({ iv: b64url(iv), ct: b64url(ct) }), { expirationTtl: PAIR_TTL_SEC });
+  }
   const res = backToSite(env, "cadence-helper=" + sid);
   res.headers.append("Set-Cookie", `${NONCE_COOKIE}=; Path=/auth; Max-Age=0; HttpOnly; Secure; SameSite=Lax`);
   return res;
@@ -247,6 +263,26 @@ async function token(req, env) {
   });
 }
 
+async function pair(req, env) {
+  let body = null;
+  try {
+    body = await req.json();
+  } catch (e) {}
+  const p = body && typeof body.pair === "string" ? body.pair : "";
+  if (!SID_RE.test(p)) return json(env, req, 400, { error: "bad_request" });
+  const key = await pairKey(p);
+  const raw = await env.TOKENS.get(key);
+  if (!raw) return json(env, req, 404, { error: "pending" }); // not signed in yet (or already collected)
+  let sid = null;
+  try {
+    const rec = JSON.parse(raw);
+    sid = dec.decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64url(rec.iv) }, await hkdfKey(unb64url(p), "cadence-helper-v1", "pairing", "aes"), unb64url(rec.ct)));
+  } catch (e) {}
+  await env.TOKENS.delete(key); // one-time
+  if (!sid || !SID_RE.test(sid)) return json(env, req, 404, { error: "pending" });
+  return json(env, req, 200, { sid });
+}
+
 async function logout(req, env) {
   const sid = await readSid(req);
   if (!sid) return json(env, req, 400, { error: "bad_request" });
@@ -273,9 +309,10 @@ export default {
       if (req.method === "GET" && url.pathname === "/") return new Response("ok", { headers: { "Content-Type": "text/plain", "Cache-Control": "no-store" } });
       if (req.method === "GET" && url.pathname === "/auth/start") return await authStart(req, env, url);
       if (req.method === "GET" && url.pathname === "/auth/callback") return await authCallback(req, env, url);
-      if (req.method === "POST" && (url.pathname === "/token" || url.pathname === "/logout")) {
+      if (req.method === "POST" && (url.pathname === "/token" || url.pathname === "/logout" || url.pathname === "/pair")) {
         const origin = req.headers.get("Origin");
         if (origin !== env.ALLOWED_ORIGIN) return json(env, req, 403, { error: "forbidden_origin" });
+        if (url.pathname === "/pair") return await pair(req, env);
         return url.pathname === "/token" ? await token(req, env) : await logout(req, env);
       }
       return new Response("Not found", { status: 404 });

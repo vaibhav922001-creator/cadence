@@ -1,6 +1,6 @@
 /* Cadence service worker: caches the app shell only (this site's own files).
    Health data lives in IndexedDB, not here. Requests to Google, Anthropic or any proxy are never cached. */
-const CACHE = "cadence-shell-0f04e7ccd663";
+const CACHE = "cadence-shell-f1ded63be7d3";
 const SHELL = ["./","./index.html","./manifest.webmanifest","./apple-touch-icon.png","./icon-192.png","./icon-512.png","./icon-maskable-512.png","./icon-maskable.svg","./icon.svg"];
 const SHELL_PATHS = new Set(SHELL.map((p) => new URL(p, self.registration.scope).pathname));
 

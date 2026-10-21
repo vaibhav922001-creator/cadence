@@ -17018,6 +17018,8 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
   // open can get a fresh 1-hour token without a pop-up. Only the random device id is kept here.
   const HELPER_KEY = "cadence.gh.helper";
   const HELPER_SID_RE = /^[A-Za-z0-9_-]{43}$/;
+  const HELPER_PAIR_KEY = "cadence.gh.pair"; // one-time code for collecting the device id after sign-in
+  const PAIR_MAX_AGE_MS = 15 * 60 * 1000;
   const SILENT_TIMEOUT_MS = 8000;
 
   /* ------------------------------------------------------------------
@@ -17849,6 +17851,7 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
     const e = /(?:^|&)cadence-helper-error=([^&]{1,80})/.exec(h);
     if (m) {
       lsSet(HELPER_KEY, { sid: m[1], helperUrl: state.helperUrl || "", since: Date.now() });
+      lsDel(HELPER_PAIR_KEY);
       out = { ok: true };
     } else if (e) {
       let code = "error";
@@ -17892,16 +17895,60 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
     if (!state.email && state.granted.includes("email")) fetchEmail();
     return { ok: true, expiresAt: state.expiresAt, missingScopes: SCOPES.filter((s) => !state.granted.includes(s)) };
   }
+  function randomId() {
+    const b = new Uint8Array(32);
+    (root.crypto || crypto).getRandomValues(b);
+    let s = "";
+    for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
   // Full-page sign-in through the helper (works in iPhone Home Screen apps, no pop-up). Call from a tap.
+  // A one-time pairing code lets this app collect its device id even when Google sign-in finishes in another browser.
   function helperSignIn() {
     if (typeof location === "undefined") throw GHError("auth", MSG.auth);
-    const q = state.email ? "?hint=" + encodeURIComponent(state.email) : "";
-    location.assign(state.helperUrl + "/auth/start" + q);
+    const pair = randomId();
+    lsSet(HELPER_PAIR_KEY, { p: pair, t: Date.now(), helperUrl: state.helperUrl });
+    const q = new URLSearchParams({ pair });
+    if (state.email) q.set("hint", state.email);
+    location.assign(state.helperUrl + "/auth/start?" + q.toString());
     return new Promise(() => {}); // the page navigates away
+  }
+  const pairPending = () => {
+    const r = lsGet(HELPER_PAIR_KEY);
+    return !!(r && typeof r.p === "string" && HELPER_SID_RE.test(r.p) && isNum(r.t) && Date.now() - r.t < PAIR_MAX_AGE_MS);
+  };
+  /** helperClaimPair() — collect the device id for a sign-in started from this app. Never rejects.
+   *  → {ok:true} | {ok:false, reason:"none"|"pending"|"network"} */
+  async function helperClaimPair() {
+    const r = lsGet(HELPER_PAIR_KEY);
+    if (!state.helperUrl || !r || !pairPending()) {
+      if (r && !pairPending()) lsDel(HELPER_PAIR_KEY);
+      return { ok: false, reason: "none" };
+    }
+    if (helperRecord()) {
+      lsDel(HELPER_PAIR_KEY);
+      return { ok: true, already: true };
+    }
+    const f = root.fetch || (typeof fetch !== "undefined" ? fetch : null);
+    try {
+      const res = await f(state.helperUrl + "/pair", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pair: r.p }) });
+      if (res.status === 404) return { ok: false, reason: "pending" };
+      const j = (await res.json().catch(() => ({}))) || {};
+      if (!res.ok || typeof j.sid !== "string" || !HELPER_SID_RE.test(j.sid)) {
+        if (res.status === 400) lsDel(HELPER_PAIR_KEY);
+        return { ok: false, reason: "network" };
+      }
+      lsSet(HELPER_KEY, { sid: j.sid, helperUrl: state.helperUrl, since: Date.now() });
+      lsDel(HELPER_PAIR_KEY);
+      state.helperNotice = { ok: true, paired: true };
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, reason: "network" };
+    }
   }
   function helperStatus() {
     const rec = helperRecord();
-    return { configured: !!state.helperUrl, signedIn: !!(state.helperUrl && rec), since: rec ? rec.since || null : null, expiresAt: rec && isNum(rec.expiresAt) ? rec.expiresAt : null, notice: state.helperNotice };
+    return { configured: !!state.helperUrl, signedIn: !!(state.helperUrl && rec), since: rec ? rec.since || null : null, expiresAt: rec && isNum(rec.expiresAt) ? rec.expiresAt : null, notice: state.helperNotice, pairPending: pairPending() };
   }
 
   function loadGis() {
@@ -18057,6 +18104,7 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
       } catch (e) {}
     }
     lsDel(HELPER_KEY);
+    lsDel(HELPER_PAIR_KEY);
     clearToken(false);
     return new Promise((resolve) => {
       try {
@@ -18372,9 +18420,9 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
 
   const api = {
     configure, connect, isConnected, disconnect, sync, mapResponses, toImport,
-    silentRefresh, tokenStatus, helperStatus, helperToken, consumeHelperRedirect,
+    silentRefresh, tokenStatus, helperStatus, helperToken, consumeHelperRedirect, helperClaimPair,
     scopes: SCOPES.slice(), identityScopes: ID_SCOPES.slice(), LIST_TYPES, ROLLUP_TYPES,
-    _internal: { filterFor, midnightMs, localInfo, localIso, chunks, request, state, restoreToken, clearToken, TOKEN_KEY, ACCOUNT_KEY, HELPER_KEY },
+    _internal: { filterFor, midnightMs, localInfo, localIso, chunks, request, state, restoreToken, clearToken, TOKEN_KEY, ACCOUNT_KEY, HELPER_KEY, HELPER_PAIR_KEY },
   };
   restoreToken(); // a refresh within the token's lifetime needs no sign-in
   consumeHelperRedirect(); // back from the helper's Google sign-in: keep the device id, clean the URL
@@ -18458,7 +18506,24 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
         return false;
       }
     };
-    const eligible = (c) => !!(c && c.clientId && c.autoSync !== false && (lastSyncMs(c) !== null || helperJustSignedIn()));
+    const helperSignedIn = () => {
+      const gh = GH();
+      try {
+        return !!(gh && typeof gh.helperStatus === "function" && gh.helperStatus().signedIn);
+      } catch (e) {
+        return false;
+      }
+    };
+    // synced before, or signed in through the sync helper (then the first sync runs by itself too)
+    const eligible = (c) => !!(c && c.clientId && c.autoSync !== false && (lastSyncMs(c) !== null || helperSignedIn()));
+    const pairPending = () => {
+      const gh = GH();
+      try {
+        return !!(gh && typeof gh.helperStatus === "function" && gh.helperStatus().pairPending);
+      } catch (e) {
+        return false;
+      }
+    };
     const usesHelper = () => {
       const gh = GH();
       try {
@@ -18577,15 +18642,26 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
         return { ok: false, reason: "in_flight" };
       }
       const c = cfg();
+      // configure first: eligibility depends on the helper sign-in, which needs the helper address
+      if (c && c.clientId && GH()) configureGH(c);
+      let paired = false;
+      if (GH() && typeof GH().helperClaimPair === "function" && pairPending()) {
+        try {
+          const pr = await GH().helperClaimPair();
+          paired = !!(pr && pr.ok);
+          note("pair:" + (pr && (pr.ok ? "ok" : pr.reason)));
+        } catch (e) {}
+      }
       if (!eligible(c)) {
         note("skip:not-eligible");
         return { ok: false, reason: "not_eligible" };
       }
-      if (now() - s.lastAutoAt < AUTO_GAP_MS && !helperJustSignedIn()) {
+      if (now() - s.lastAutoAt < AUTO_GAP_MS && !helperJustSignedIn() && !paired) {
         note("skip:throttled");
         return { ok: false, reason: "throttled" };
       }
       if (!GH() || !configureGH(c)) return { ok: false, reason: "no_connector" };
+      if (paired || helperJustSignedIn()) hideBanner();
       s.lastAutoAt = now();
       if (tokenValid()) return doSync(reason);
       // expired: try without a click; browsers usually block it outside a tap
@@ -18623,6 +18699,7 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
 
     function onVisible() {
       if (!doc || doc.visibilityState !== "visible") return;
+      if (pairPending()) return run("visible+pair"); // back from Google sign-in in another browser
       const last = lastSyncMs(cfg());
       if (last !== null && now() - last <= STALE_MS) return;
       run("visible");
