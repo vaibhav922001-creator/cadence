@@ -16523,7 +16523,9 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
 
   /* ===================================================== Google Health (website only) */
   const G_LS = "cadence.google";
-  const gDefaults = () => ({ clientId: "974274557373-akp5c3i2ml53aivk8skbob3eh72b8ojs.apps.googleusercontent.com", proxyUrl: "", lastSync: null, lastCount: 0, sources: [], warnings: [], autoSync: true, firstDays: 90 });
+  // Cadence sync helper (site/helper/worker.js on Cloudflare): long-lived sign-in so every open syncs without a tap.
+  const HELPER_URL = "https://cadence-sync.vaibhav-gupta922001.workers.dev";
+  const gDefaults = () => ({ clientId: "974274557373-akp5c3i2ml53aivk8skbob3eh72b8ojs.apps.googleusercontent.com", proxyUrl: "", helperUrl: HELPER_URL, lastSync: null, lastCount: 0, sources: [], warnings: [], autoSync: true, firstDays: 90 });
   function gLoad() {
     try {
       const j = JSON.parse(localStorage.getItem(G_LS) || "null");
@@ -16592,7 +16594,7 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
     const gh = GH();
     if (!gh || !g.cfg.clientId) return false;
     try {
-      gh.configure({ clientId: g.cfg.clientId, proxyUrl: g.cfg.proxyUrl || undefined });
+      gh.configure({ clientId: g.cfg.clientId, proxyUrl: g.cfg.proxyUrl || undefined, helperUrl: g.cfg.helperUrl || HELPER_URL || "" });
       g.configured = true;
     } catch (e) {
       g.configured = false;
@@ -16604,7 +16606,7 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
     const gh = GH();
     let c = false;
     try {
-      c = gh && g.configured ? !!(await gh.isConnected()) : false;
+      c = gh && g.configured ? !!(await gh.isConnected()) || !!(gh.helperStatus && gh.helperStatus().signedIn) : false;
     } catch (e) {
       c = false;
     }
@@ -16844,12 +16846,24 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
       ${msg}
       ${sources}
       ${warns}
-      ${g.connected ? `<label class="gh-auto"><input type="checkbox" data-input="gh:auto"${c.autoSync ? " checked" : ""}> <span>Sync automatically when I open or refresh Cadence<br><span class="small muted">Only while Google still has you signed in. If Google's sign-in has expired, Cadence shows a one-tap Sync bar.</span></span></label>` : ""}
+      ${g.connected ? `<label class="gh-auto"><input type="checkbox" data-input="gh:auto"${c.autoSync ? " checked" : ""}> <span>Sync automatically when I open or refresh Cadence<br><span class="small muted">${gHelperNote()}</span></span></label>` : ""}
       <p class="note">Your Client ID${c.proxyUrl ? " and proxy URL are" : " is"} saved in this browser. Health data goes from Google to this browser only. <button class="linkish" type="button" data-action="gh:edit">Change settings</button></p>
     </div>`;
   }
 
   /* website: configure, then optionally sync on open (no pop-ups; only with a live sign-in) */
+  function gHelperNote() {
+    const gh = GH();
+    const st = gh && gh.helperStatus ? gh.helperStatus() : null;
+    if (st && st.configured && st.signedIn) {
+      const due = st.expiresAt || (st.since ? st.since + 7 * 864e5 : null);
+      const when = due ? new Date(due).toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" }) : null;
+      return "Syncs every time you open Cadence, with no tap. Google asks you to sign in again about once a week" + (when ? " (next: " + when + ")" : "") + ".";
+    }
+    if (st && st.configured) return "Tap Connect Google Health once to turn on tap-free auto-sync. Google asks again about once a week.";
+    return "Only while Google still has you signed in. If Google's sign-in has expired, Cadence shows a one-tap Sync bar.";
+  }
+
   function gStartup() {
     if (!isWeb()) return;
     let tries = 0;
@@ -16860,6 +16874,15 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
       }
       if (!GH() || !g.cfg.clientId) return;
       gConfigure();
+      try {
+        const st = GH().helperStatus ? GH().helperStatus() : null;
+        if (st && st.notice && !st.notice.ok) {
+          const why = st.notice.error === "access_denied" ? "you cancelled it" : "Google returned \"" + st.notice.error + "\"";
+          g.msg = { ok: false, text: "Google sign-in didn't finish (" + why + "). Tap Connect Google Health to try again." };
+        } else if (st && st.notice && st.notice.ok) {
+          g.msg = { ok: true, text: "Signed in. Cadence will now sync every time you open it." };
+        }
+      } catch (e) {}
       await gRefresh(); // auto-sync on load/refresh/focus is driven by src/autosync.js via App.ghSync
     };
     setTimeout(tick, 0);
@@ -16991,6 +17014,10 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
   const USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo";
   const TOKEN_KEY = "cadence.gh.token";
   const ACCOUNT_KEY = "cadence.gh.account";
+  // sync helper (Cloudflare Worker, site/helper/worker.js): keeps a long-lived read-only Google sign-in so every
+  // open can get a fresh 1-hour token without a pop-up. Only the random device id is kept here.
+  const HELPER_KEY = "cadence.gh.helper";
+  const HELPER_SID_RE = /^[A-Za-z0-9_-]{43}$/;
   const SILENT_TIMEOUT_MS = 8000;
 
   /* ------------------------------------------------------------------
@@ -17682,7 +17709,7 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
   /* ==================================================================
    * Network layer
    * ================================================================== */
-  const state = { clientId: "", proxyUrl: "", token: null, expiresAt: 0, granted: [], email: "", tokenClient: null, gisPromise: null };
+  const state = { clientId: "", proxyUrl: "", helperUrl: "", helperNotice: null, token: null, expiresAt: 0, granted: [], email: "", tokenClient: null, gisPromise: null };
 
   /* ---------- token persistence (this browser only) ---------- */
   function ls() {
@@ -17797,8 +17824,84 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
       state.restoredClientId = "";
     }
     if (typeof cfg.proxyUrl === "string") state.proxyUrl = cfg.proxyUrl.trim().replace(/\/+$/, "");
+    if (typeof cfg.helperUrl === "string") {
+      const h = cfg.helperUrl.trim().replace(/\/+$/, "");
+      state.helperUrl = /^https:\/\/[^\s/]+$/.test(h) ? h : "";
+    }
     if (state.clientId && typeof document !== "undefined") loadGis().catch(() => {}); // preload so connect() stays inside the click
-    return { clientId: state.clientId, proxyUrl: state.proxyUrl };
+    return { clientId: state.clientId, proxyUrl: state.proxyUrl, helperUrl: state.helperUrl };
+  }
+
+  /* ---------- sync helper ---------- */
+  function helperRecord() {
+    const r = lsGet(HELPER_KEY);
+    if (!r || typeof r.sid !== "string" || !HELPER_SID_RE.test(r.sid)) return null;
+    if (state.helperUrl && r.helperUrl && r.helperUrl !== state.helperUrl) return null; // set up with another helper
+    return r;
+  }
+  const helperActive = () => !!(state.helperUrl && helperRecord());
+  // Read #cadence-helper=<id> / #cadence-helper-error=<code> left by the helper after Google sign-in, then clean the URL.
+  function consumeHelperRedirect() {
+    if (typeof location === "undefined" || !location.hash) return null;
+    const h = location.hash.slice(1);
+    let out = null;
+    const m = /(?:^|&)cadence-helper=([A-Za-z0-9_-]{43})(?:&|$)/.exec(h);
+    const e = /(?:^|&)cadence-helper-error=([^&]{1,80})/.exec(h);
+    if (m) {
+      lsSet(HELPER_KEY, { sid: m[1], helperUrl: state.helperUrl || "", since: Date.now() });
+      out = { ok: true };
+    } else if (e) {
+      let code = "error";
+      try { code = decodeURIComponent(e[1]); } catch (x) {}
+      out = { ok: false, error: code };
+    }
+    if (out) {
+      state.helperNotice = out;
+      try {
+        if (typeof history !== "undefined" && history.replaceState) history.replaceState(null, "", location.pathname + location.search);
+        else location.hash = "";
+      } catch (x) {}
+    }
+    return out;
+  }
+  /** helperToken() — ask the helper for a fresh access token. Never rejects.
+   *  → {ok:true} | {ok:false, needsTap:true, reason:"reauth"|"no_helper"} | {ok:false, needsTap:false, reason:"network"|"upstream"} */
+  async function helperToken() {
+    const rec = helperRecord();
+    if (!state.helperUrl || !rec) return { ok: false, needsTap: true, reason: "no_helper" };
+    const f = root.fetch || (typeof fetch !== "undefined" ? fetch : null);
+    if (!f) return { ok: false, needsTap: false, reason: "network" };
+    let res, j = {};
+    try {
+      res = await f(state.helperUrl + "/token", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sid: rec.sid }) });
+      try { j = (await res.json()) || {}; } catch (x) {}
+    } catch (x) {
+      return { ok: false, needsTap: false, reason: "network" };
+    }
+    if (res.status === 401 || res.status === 400) {
+      lsDel(HELPER_KEY); // weekly expiry or revoked: one sign-in needed
+      return { ok: false, needsTap: true, reason: "reauth" };
+    }
+    if (!res.ok || typeof j.access_token !== "string" || !j.access_token) return { ok: false, needsTap: false, reason: "upstream" };
+    state.token = j.access_token;
+    state.expiresAt = Date.now() + (Number(j.expires_in) || 3599) * 1000;
+    const granted = String(j.scope || "").split(/\s+/).filter(Boolean);
+    state.granted = granted.length ? SCOPES.concat(ID_SCOPES).filter((s) => granted.includes(s)) : SCOPES.slice();
+    if (isNum(j.expires_at)) lsSet(HELPER_KEY, Object.assign({}, rec, { expiresAt: j.expires_at }));
+    saveToken();
+    if (!state.email && state.granted.includes("email")) fetchEmail();
+    return { ok: true, expiresAt: state.expiresAt, missingScopes: SCOPES.filter((s) => !state.granted.includes(s)) };
+  }
+  // Full-page sign-in through the helper (works in iPhone Home Screen apps, no pop-up). Call from a tap.
+  function helperSignIn() {
+    if (typeof location === "undefined") throw GHError("auth", MSG.auth);
+    const q = state.email ? "?hint=" + encodeURIComponent(state.email) : "";
+    location.assign(state.helperUrl + "/auth/start" + q);
+    return new Promise(() => {}); // the page navigates away
+  }
+  function helperStatus() {
+    const rec = helperRecord();
+    return { configured: !!state.helperUrl, signedIn: !!(state.helperUrl && rec), since: rec ? rec.since || null : null, expiresAt: rec && isNum(rec.expiresAt) ? rec.expiresAt : null, notice: state.helperNotice };
   }
 
   function loadGis() {
@@ -17854,6 +17957,14 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
    */
   async function connect(opts) {
     opts = opts || {};
+    if (state.helperUrl) {
+      if (helperRecord()) {
+        const r = await helperToken();
+        if (r.ok) return r;
+        if (!r.needsTap) throw GHError("network", "Could not reach the Cadence sync helper. Check your connection and try again.", r.reason);
+      }
+      return helperSignIn();
+    }
     if (!state.clientId) throw GHError("auth", MSG.no_client);
     await loadGis();
     const oauth2 = root.google.accounts.oauth2;
@@ -17886,6 +17997,13 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
    */
   async function silentRefresh(opts) {
     opts = opts || {};
+    if (state.helperUrl) {
+      if (helperRecord()) {
+        const r = await helperToken();
+        if (r.ok || !r.needsTap) return r;
+      }
+      return { ok: false, needsTap: true, reason: "reauth" }; // a tap opens the helper sign-in (no pop-up)
+    }
     if (!state.clientId) return { ok: false, needsTap: false, reason: "no_client" };
     try {
       await loadGis();
@@ -17932,6 +18050,13 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
 
   function disconnect() {
     const tok = state.token;
+    const hrec = helperRecord();
+    if (hrec && state.helperUrl) {
+      try {
+        (root.fetch || fetch)(state.helperUrl + "/logout", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sid: hrec.sid }) }).catch(() => {});
+      } catch (e) {}
+    }
+    lsDel(HELPER_KEY);
     clearToken(false);
     return new Promise((resolve) => {
       try {
@@ -17992,6 +18117,14 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
       }
       if (res.status === 401) {
         clearToken(true); // token rejected: forget it, keep the account hint
+        if (attempt < 6 && helperActive()) {
+          const r = await helperToken(); // the helper can mint a new token without a tap
+          if (r.ok) {
+            headers.Authorization = `Bearer ${state.token}`;
+            attempt = 6;
+            continue;
+          }
+        }
         throw GHError("auth", MSG.auth, msg);
       }
       if (res.status === 429) throw GHError("rate_limited", MSG.rate_limited, msg);
@@ -18135,7 +18268,10 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
   async function sync(opts) {
     opts = opts || {};
     const tz = opts.tz || defaultTz();
-    if (!isConnected()) await connect();
+    if (!isConnected()) {
+      const r = helperActive() ? await helperToken() : null;
+      if (!r || !r.ok) await connect();
+    }
     const today = localInfo(Date.now(), tz).date;
     const nDays = Math.max(1, Math.min(365, Math.round(opts.days || 90)));
     let start = typeof opts.since === "string" && /^\d{4}-\d{2}-\d{2}$/.test(opts.since) ? opts.since : addDays(today, -(nDays - 1));
@@ -18236,11 +18372,12 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
 
   const api = {
     configure, connect, isConnected, disconnect, sync, mapResponses, toImport,
-    silentRefresh, tokenStatus,
+    silentRefresh, tokenStatus, helperStatus, helperToken, consumeHelperRedirect,
     scopes: SCOPES.slice(), identityScopes: ID_SCOPES.slice(), LIST_TYPES, ROLLUP_TYPES,
-    _internal: { filterFor, midnightMs, localInfo, localIso, chunks, request, state, restoreToken, clearToken, TOKEN_KEY, ACCOUNT_KEY },
+    _internal: { filterFor, midnightMs, localInfo, localIso, chunks, request, state, restoreToken, clearToken, TOKEN_KEY, ACCOUNT_KEY, HELPER_KEY },
   };
   restoreToken(); // a refresh within the token's lifetime needs no sign-in
+  consumeHelperRedirect(); // back from the helper's Google sign-in: keep the device id, clean the URL
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   if (root) root.GoogleHealth = api;
 })(typeof window !== "undefined" ? window : globalThis);
@@ -18311,15 +18448,34 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
       return isFinite(t) ? t : null;
     };
     // configured and synced before (the first sync stays manual so the user picks the range)
-    const eligible = (c) => !!(c && c.clientId && c.autoSync !== false && lastSyncMs(c) !== null);
+    // just back from the sync helper's Google sign-in → sync now, even the very first time
+    const helperJustSignedIn = () => {
+      const gh = GH();
+      try {
+        const st = gh && typeof gh.helperStatus === "function" ? gh.helperStatus() : null;
+        return !!(st && st.notice && st.notice.ok && st.signedIn);
+      } catch (e) {
+        return false;
+      }
+    };
+    const eligible = (c) => !!(c && c.clientId && c.autoSync !== false && (lastSyncMs(c) !== null || helperJustSignedIn()));
+    const usesHelper = () => {
+      const gh = GH();
+      try {
+        return !!(gh && typeof gh.helperStatus === "function" && gh.helperStatus().configured);
+      } catch (e) {
+        return false;
+      }
+    };
 
     function configureGH(c) {
       const gh = GH();
       if (!gh || !c) return false;
       try {
         const cur = gh._internal && gh._internal.state;
-        if (!cur || cur.clientId !== c.clientId || (typeof c.proxyUrl === "string" && cur.proxyUrl !== c.proxyUrl.trim().replace(/\/+$/, ""))) {
-          gh.configure({ clientId: c.clientId, proxyUrl: typeof c.proxyUrl === "string" ? c.proxyUrl : undefined });
+        const norm = (u) => (typeof u === "string" ? u.trim().replace(/\/+$/, "") : u);
+        if (!cur || cur.clientId !== c.clientId || (typeof c.proxyUrl === "string" && cur.proxyUrl !== norm(c.proxyUrl)) || (typeof c.helperUrl === "string" && cur.helperUrl !== norm(c.helperUrl))) {
+          gh.configure({ clientId: c.clientId, proxyUrl: typeof c.proxyUrl === "string" ? c.proxyUrl : undefined, helperUrl: typeof c.helperUrl === "string" ? c.helperUrl : undefined });
         }
         return true;
       } catch (e) {
@@ -18357,7 +18513,7 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
       const go = doc.createElement("button");
       go.type = "button";
       go.setAttribute("data-autosync", "tap");
-      go.textContent = "Tap to sync your latest Fitbit data";
+      go.textContent = usesHelper() ? "Sign in to Google to keep auto-sync on (once a week)" : "Tap to sync your latest Fitbit data";
       go.style.cssText = "flex:0 1 auto;min-height:36px;padding:6px 14px;border:0;border-radius:999px;cursor:pointer;background:var(--strain, #2f6fed);color:var(--surface, #ffffff);font:inherit;font-weight:600";
       const x = doc.createElement("button");
       x.type = "button";
@@ -18425,7 +18581,7 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
         note("skip:not-eligible");
         return { ok: false, reason: "not_eligible" };
       }
-      if (now() - s.lastAutoAt < AUTO_GAP_MS) {
+      if (now() - s.lastAutoAt < AUTO_GAP_MS && !helperJustSignedIn()) {
         note("skip:throttled");
         return { ok: false, reason: "throttled" };
       }
