@@ -4660,7 +4660,7 @@ var PulseCore = (() => {
     overlapShrink: 0.75,
     /** Gompertz mortality-rate doubling time, years (Finch et al. 1990: about 8). */
     doublingYears: 8,
-    /** Pulse Age = age ± at most this (*tunable*). */
+    /** biological age = age ± at most this (*tunable*). */
     clampYears: 15,
     /** S in Pace = 1 + (Δ30d − Δ6mo) / S (*tunable*). */
     paceScaleYears: 5,
@@ -4765,7 +4765,7 @@ var PulseCore = (() => {
     return {
       pulseAge: profile.age + deltaYears,
       deltaYears,
-      // Unclamped deltas, so a change still shows while Pulse Age sits at the clamp.
+      // Unclamped deltas, so a change still shows while biological age sits at the clamp.
       paceOfAging: clamp4(1 + (b.years - a.years) / cfg2.paceScaleYears, cfg2.paceMin, cfg2.paceMax),
       contributions: a.contributions.map((c) => ({ ...c, recent: short[c.key] ?? c.value })),
       vo2maxSource: long.vo2max == null ? null : run ? "run" : "daily",
@@ -4794,7 +4794,7 @@ var PulseCore = (() => {
     if (state2 === "outperforming")
       return { state: state2, title: "Outperforming", body: `You're boosting your long-term health with your ${name}. Keep it up to hold on to the benefit.` };
     if (state2 === "underperforming")
-      return { state: state2, title: "Room to improve", body: `Your ${name} is adding years to your Pulse Age. Moving it toward the target for your age would take them off.` };
+      return { state: state2, title: "Room to improve", body: `Your ${name} is adding years to your biological age. Moving it toward the target for your age would take them off.` };
     return { state: state2, title: "On track", body: `Your ${name} is close to the target for your age. Small gains here add up over the years.` };
   }
 
