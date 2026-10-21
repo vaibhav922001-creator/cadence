@@ -16524,12 +16524,14 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
   /* ===================================================== Google Health (website only) */
   const G_LS = "cadence.google";
   // Cadence sync helper (site/helper/worker.js on Cloudflare): long-lived sign-in so every open syncs without a tap.
-  const HELPER_URL = "https://cadence-sync.vaibhav-gupta922001.workers.dev";
+  // Switched off for now (owner's choice): Cadence uses the Google pop-up sign-in + one-tap Sync bar.
+  // To turn tap-free auto-sync back on later, set this to "https://cadence-sync.vaibhav-gupta922001.workers.dev".
+  const HELPER_URL = "";
   const gDefaults = () => ({ clientId: "974274557373-akp5c3i2ml53aivk8skbob3eh72b8ojs.apps.googleusercontent.com", proxyUrl: "", helperUrl: HELPER_URL, lastSync: null, lastCount: 0, sources: [], warnings: [], autoSync: true, firstDays: 90 });
   function gLoad() {
     try {
       const j = JSON.parse(localStorage.getItem(G_LS) || "null");
-      return j && typeof j === "object" ? { ...gDefaults(), ...j } : gDefaults();
+      return j && typeof j === "object" ? { ...gDefaults(), ...j, helperUrl: HELPER_URL } : gDefaults(); // helper on/off follows HELPER_URL, not old saved settings
     } catch (e) {
       return gDefaults();
     }
