@@ -14662,7 +14662,7 @@ Rules: be concise (under ~180 words unless they ask for a plan or review). Use o
         <li>Paste it below.</li>
       </ol>
       <form data-submit="coach-key" class="co-form" autocomplete="off">
-        <label class="field co-field"><span>Gemini key (or Anthropic key)</span><input name="key" type="password" autocomplete="off" spellcheck="false" placeholder="AIza…" required ${keyState.checking ? "disabled" : ""}></label>
+        <label class="field co-field"><span>Gemini key (or Anthropic key)</span><input name="key" type="password" autocomplete="off" spellcheck="false" placeholder="AQ.… or AIza…" required ${keyState.checking ? "disabled" : ""}></label>
         <button class="btn primary" type="submit" ${keyState.checking ? "disabled" : ""}>${keyState.checking ? "Checking…" : "Use my key"}</button>
       </form>
       <p class="note">The key is stored only in this browser, never on a server. Anyone who can use this browser can use it. Each question sends a summary of your daily health numbers to Google (or Anthropic). On Gemini's free tier Google may use that to improve its products.</p>
@@ -14683,8 +14683,10 @@ Rules: be concise (under ~180 words unless they ask for a plan or review). Use o
       App.toast("Coach turned on");
       return App.rerender();
     }
-    if (!/^AIza[0-9A-Za-z_\-]{30,}$/.test(k)) {
-      App.toast("That doesn't look like a Gemini key. It starts with AIza.");
+    // Google's key formats change (AIza… older keys, AQ.… auth keys from AI Studio since May 2026): only a loose
+    // sanity check here; Google itself decides whether the key is valid
+    if (!/^[A-Za-z0-9._\-]{20,}$/.test(k)) {
+      App.toast("That doesn't look like a Gemini key. Copy it again from AI Studio (it starts with AQ. or AIza).");
       return;
     }
     keyState.checking = true;
