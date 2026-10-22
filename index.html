@@ -10397,6 +10397,8 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
     return isNum(days) && days >= 0 ? Math.round((days / 365.2425) * 100) / 100 : null;
   }
   const monthOf = (date) => date.slice(0, 7);
+  /* a stored day with data beyond the date and sync metadata (`_sync`) */
+  const realDay = (d) => !!d && typeof d === "object" && Object.keys(d).some((k) => k !== "date" && k !== "entry" && k !== "_sync");
   const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
   const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   const toDate = (x) => {
@@ -10517,7 +10519,11 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
     for (const date of Object.keys(S.entries)) if (!map.has(date)) map.set(date, { date });
     const out = [...map.values()]
       .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0))
-      .map((d) => ({ ...d, entry: normEntry(rawEntry(d.date)) }));
+      .map((d) => {
+        if (d._sync === undefined) return { ...d, entry: normEntry(rawEntry(d.date)) };
+        const { _sync, ...rest } = d; // sync metadata stays out of the engine and views
+        return { ...rest, entry: normEntry(rawEntry(d.date)) };
+      });
     S.daysCache = out;
     S.daysVer = S.ver;
     return out;
@@ -10554,7 +10560,7 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
     }
     return -1;
   }
-  const hasData = (d) => d && Object.keys(d).some((k) => k !== "date" && k !== "entry");
+  const hasData = (d) => d && Object.keys(d).some((k) => k !== "date" && k !== "entry" && k !== "_sync");
   function latestDate() {
     const ds = days();
     for (let i = ds.length - 1; i >= 0; i--) if (hasData(ds[i])) return ds[i].date;
@@ -10666,7 +10672,7 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
       S.health = j.health && typeof j.health === "object" ? j.health : {};
       S.entries = j.entries && typeof j.entries === "object" ? j.entries : {};
       S.profile = j.profile && typeof j.profile === "object" ? j.profile : null;
-      S.mode = Object.keys(S.health).length ? "mine" : "sample";
+      S.mode = Object.values(S.health).some(realDay) ? "mine" : "sample";
       return true;
     } catch (e) {
       return false;
@@ -10820,7 +10826,7 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
         S.health = c.health;
         S.entries = { ...c.entries, ...pendingLocalEntries() };
         S.profile = c.profile || S.profile;
-        S.mode = Object.keys(S.health).length ? "mine" : "sample";
+        S.mode = Object.values(S.health).some(realDay) ? "mine" : "sample";
       } else if (Object.keys(S.health).length || Object.keys(S.entries).length || S.profile) {
         // carry over what an older version kept in localStorage, then drop that copy
         try {
@@ -10879,7 +10885,7 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
           S.health = c.health;
           S.entries = { ...c.entries, ...pendingLocalEntries() };
           S.profile = c.profile || S.profile;
-          S.mode = Object.keys(S.health).length ? "mine" : "sample";
+          S.mode = Object.values(S.health).some(realDay) ? "mine" : "sample";
         } else if (Object.keys(S.health).length || Object.keys(S.entries).length || S.profile) {
           migrateToCloud().catch(() => {});
         }
@@ -10940,27 +10946,271 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
     rerender();
     return clean;
   }
-  /* opts.merge: keep fields the new day doesn't carry (used for Google Health sync) */
+  /* ---------------- sync v2: per-field merge, coverage, sync plan (CONTRACT-SYNC2) ---------------- */
+  const SERIES_KEYS = ["hr1", "hr", "hrHist", "steps5", "steps1"];
+  const addDaysYmd = (date, n) => {
+    const d = E.parseYmd(date);
+    d.setDate(d.getDate() + n);
+    return E.ymd(d);
+  };
+  const isEmptyVal = (v) =>
+    v == null ||
+    (typeof v === "number" && !isFinite(v)) ||
+    (Array.isArray(v) && !v.length) ||
+    (typeof v === "object" && !Array.isArray(v) && !Object.keys(v).length) ||
+    (typeof v === "string" && !v);
+  const pairs = (a) => (Array.isArray(a) ? a.filter((x) => Array.isArray(x) && isNum(x[0]) && isNum(x[1])) : []);
+  /* heart-rate minutes a day carries: 1-min series, else 5-min curve, else histogram total */
+  function hrMinutesOf(d) {
+    if (!d) return 0;
+    const h1 = pairs(d.hr1);
+    if (h1.length) return new Set(h1.map((x) => Math.floor(x[0]))).size;
+    const h = pairs(d.hr);
+    if (h.length) return Math.min(1440, new Set(h.map((x) => Math.floor(x[0] / 5))).size * 5);
+    const c = d.hrHist && Array.isArray(d.hrHist.counts) ? d.hrHist.counts.reduce((s, v) => s + (isNum(v) ? v : 0), 0) : 0;
+    return Math.min(1440, Math.round(c));
+  }
+  /* how much a series covers: minutes for heart rate, total counts for steps / histograms */
+  function seriesCoverage(key, v) {
+    if (key === "hr1") return new Set(pairs(v).map((x) => Math.floor(x[0]))).size;
+    if (key === "hr") return new Set(pairs(v).map((x) => Math.floor(x[0] / 5))).size * 5;
+    if (key === "hrHist") return v && Array.isArray(v.counts) ? v.counts.reduce((s, x) => s + (isNum(x) ? x : 0), 0) : 0;
+    if (key === "steps5" || key === "steps1") return pairs(v).reduce((s, x) => s + x[1], 0);
+    return 0;
+  }
+  function coverageOf(d) {
+    return {
+      hrMinutes: hrMinutesOf(d),
+      sleep: !!(d && d.sleep && d.sleep.start),
+      workouts: d && Array.isArray(d.workouts) ? d.workouts.length : 0,
+      steps: !!(d && (isNum(d.steps) || pairs(d.steps5).length || pairs(d.steps1).length)),
+    };
+  }
+  const tMs = (s) => Date.parse(s);
+  const near5 = (a, b) => isFinite(tMs(a)) && isFinite(tMs(b)) && Math.abs(tMs(a) - tMs(b)) <= 5 * 60000;
+  const sleepLen = (s) => (s && isFinite(tMs(s.end)) && isFinite(tMs(s.start)) ? tMs(s.end) - tMs(s.start) : 0);
+  const wRich = (w) => (w && Array.isArray(w.hrSeries) && w.hrSeries.length ? 2 : 0) + (w && isNum(w.avgHr) ? 1 : 0);
+  /* union by start time (±5 min); `pick(old, new)` chooses the entry kept for a match */
+  function unionByStart(oldA, newA, pick) {
+    const out = (Array.isArray(oldA) ? oldA : []).map((x) => x);
+    for (const n of Array.isArray(newA) ? newA : []) {
+      if (!n || typeof n !== "object") continue;
+      const k = out.findIndex((o) => o && near5(o.start, n.start));
+      if (k === -1) out.push(n);
+      else out[k] = pick(out[k], n);
+    }
+    return out.sort((a, b) => (tMs(a.start) || 0) - (tMs(b.start) || 0));
+  }
+  const pickWorkout = (o, n) => (wRich(o) > wRich(n) ? { ...n, ...o } : { ...o, ...n });
+  /* merge one day: `fresh` (today / yesterday) → new wins, else the richer value wins; never replace data with empty */
+  function mergeDay(prev, next, fresh) {
+    const out = { ...prev };
+    for (const k of Object.keys(next)) {
+      if (k === "date" || k === "entry") continue;
+      const nv = next[k], ov = prev[k];
+      if (k === "_sync") {
+        out._sync = { ...(ov && typeof ov === "object" ? ov : {}), ...(nv && typeof nv === "object" ? nv : {}) };
+        continue;
+      }
+      if (isEmptyVal(nv)) continue; // never replace with empty / missing
+      if (isEmptyVal(ov)) { out[k] = nv; continue; }
+      if (typeof nv === "number") { out[k] = nv; continue; } // finite new scalar wins
+      if (fresh) { out[k] = nv; continue; }
+      if (SERIES_KEYS.includes(k)) out[k] = seriesCoverage(k, nv) >= seriesCoverage(k, ov) ? nv : ov;
+      else if (k === "sleep") {
+        const sameStart = Math.abs((tMs(nv.start) || 0) - (tMs(ov.start) || 0)) < 60000;
+        out[k] = !sameStart || sleepLen(nv) >= sleepLen(ov) ? nv : ov;
+      } else if (k === "workouts") out[k] = unionByStart(ov, nv, pickWorkout);
+      else if (k === "naps") out[k] = unionByStart(ov, nv, (o, n) => n);
+      else out[k] = nv;
+    }
+    return out;
+  }
+  /* opts.merge: smart per-field merge (Google Health sync); otherwise a day replaces the stored one (file import) */
   async function importDays(list, opts) {
     const merge = !!(opts && opts.merge);
     const valid = (list || []).filter((d) => d && /^\d{4}-\d{2}-\d{2}$/.test(d.date || ""));
     if (!valid.length) return 0;
     const months = new Set();
+    const today = (opts && opts.today) || todayStr();
+    const yest = addDaysYmd(today, -1);
     for (const d of valid) {
       const { entry, ...rest } = d;
       const prev = merge ? S.health[d.date] : null;
-      S.health[d.date] = prev ? { ...prev, ...clone(rest) } : clone(rest);
+      S.health[d.date] = prev ? mergeDay(prev, clone(rest), d.date >= yest) : clone(rest);
       months.add(monthOf(d.date));
     }
     S.mode = "mine";
     bump();
     S.sel = latestDate();
+    await persistHealthMonths(months);
+    rerender();
+    return valid.length;
+  }
+  async function persistHealthMonths(months) {
     if (docMode()) {
       for (const m of [...months].sort()) await writeDoc("h-" + m, packMonth(monthSlice(S.health, m)));
     }
     saveLocalNow();
-    rerender();
-    return valid.length;
+  }
+  /* record sync metadata for dates without touching their data.
+   * info: {at, empty:[dates], failed:[dates], ok:[dates], coverage:{date: {...}}} */
+  async function markSync(info) {
+    info = info || {};
+    const at = info.at || new Date().toISOString();
+    const months = new Set();
+    const touch = (date, fn) => {
+      if (!validYmd(date)) return;
+      const rec = S.health[date] || { date };
+      rec._sync = fn({ ...(rec._sync || {}) }, rec);
+      S.health[date] = rec;
+      months.add(monthOf(date));
+    };
+    for (const date of info.ok || []) touch(date, (s, rec) => {
+      const o = { ...s, at, coverage: (info.coverage && info.coverage[date]) || coverageOf(rec) };
+      delete o.failed;
+      if (o.coverage.hrMinutes > 0 || o.coverage.sleep || o.coverage.steps) { delete o.empty; delete o.checks; }
+      return o;
+    });
+    for (const date of info.empty || []) touch(date, (s, rec) => {
+      const o = { ...s, at, coverage: coverageOf(rec), empty: true, checks: (s.checks || 0) + 1 };
+      delete o.failed;
+      return o;
+    });
+    for (const date of info.failed || []) touch(date, (s) => ({ ...s, failed: at }));
+    if (!months.size) return 0;
+    if (S.mode !== "mine" && Object.values(S.health).some(hasRealData)) S.mode = "mine";
+    bump();
+    await persistHealthMonths(months);
+    return months.size;
+  }
+  const hasRealData = realDay;
+  function syncMeta(date) {
+    const r = S.health[date];
+    return r && r._sync ? clone(r._sync) : null;
+  }
+  /* day status for the Data check and the sync plan:
+   * {state:"complete"|"partial"|"missing", reason:"no_hr"|"short_wear"|"no_sleep"|"sync_failed"|null, hrMinutes} */
+  function dayStatus(date, today) {
+    today = today || todayStr();
+    const rec = S.health[date] || null;
+    const meta = rec && rec._sync;
+    if (!hasRealData(rec)) return { state: "missing", reason: meta && meta.failed ? "sync_failed" : null, hrMinutes: 0, checked: !!(meta && meta.at) };
+    const hrMinutes = hrMinutesOf(rec);
+    let reason = null;
+    if (meta && meta.failed) reason = "sync_failed";
+    else if (!hrMinutes) reason = "no_hr";
+    else if (date !== today && hrMinutes < 360) reason = "short_wear";
+    else if (!(rec.sleep && rec.sleep.start)) {
+      const nb = [addDaysYmd(date, -1), addDaysYmd(date, 1)].map((x) => S.health[x]);
+      if (nb.some((x) => x && x.sleep && x.sleep.start)) reason = "no_sleep";
+    }
+    return { state: reason ? "partial" : "complete", reason, hrMinutes, checked: !!(meta && meta.at) };
+  }
+  const HISTORY_CHOICES = [30, 90, 180, 365];
+  const SYNC_CAP_DAYS = 45;
+  function historyDaysSetting(opts) {
+    let n = opts && opts.historyDays;
+    if (n == null) {
+      try {
+        const c = root.App && typeof root.App.ghConfig === "function" ? root.App.ghConfig() : null;
+        n = c ? (c.historyDays != null ? c.historyDays : c.firstDays) : null;
+      } catch (e) {}
+    }
+    n = +n;
+    return HISTORY_CHOICES.includes(n) ? n : 90;
+  }
+  function toRuns(dates) {
+    const s = [...new Set(dates)].sort();
+    const runs = [];
+    for (const d of s) {
+      const last = runs[runs.length - 1];
+      if (last && addDaysYmd(last.end, 1) === d) last.end = d;
+      else runs.push({ start: d, end: d });
+    }
+    return runs;
+  }
+  /* which dates the next sync should fetch.
+   * opts: {historyDays, now (ms), fix (only gaps, ignore "checked" marks), cap} */
+  function syncPlanDetail(today, opts) {
+    opts = opts || {};
+    today = validYmd(today) ? today : todayStr();
+    const now = isNum(opts.now) ? opts.now : Date.now();
+    const hist = historyDaysSetting(opts);
+    const cap = isNum(opts.cap) && opts.cap > 0 ? opts.cap : SYNC_CAP_DAYS;
+    const winStart = addDaysYmd(today, -(hist - 1));
+    const yest = addDaysYmd(today, -1);
+    const stored = Object.keys(S.health).filter((d) => validYmd(d) && d <= today && (hasRealData(S.health[d]) || S.health[d]._sync)).sort();
+    const earliest = stored.length ? stored[0] : null;
+    const reasons = {};
+    const order = [];
+    const add = (d, why) => {
+      if (d < winStart || d > today || reasons[d]) return;
+      reasons[d] = why;
+      order.push(d);
+    };
+    // recently checked and still empty/thin: skip; checked twice well after the date: stable, skip until "Fix"
+    const skipChecked = (d) => {
+      if (opts.fix) return false;
+      const m = S.health[d] && S.health[d]._sync;
+      if (!m || !m.at || m.failed) return false;
+      const at = Date.parse(m.at);
+      if (!isFinite(at)) return false;
+      if (now - at < 3 * 864e5) return true;
+      // fetched well after the date and still thin/empty: that is what Google has. Partial days settle after one
+      // such fetch, empty days after two; "Fix missing days" still retries them.
+      const settled = at - E.parseYmd(d).getTime() > 4 * 864e5;
+      return settled && (hasRealData(S.health[d]) || (m.checks || 0) >= 2);
+    };
+    const gapDates = [];
+    if (earliest) {
+      for (let d = earliest < winStart ? winStart : earliest; d <= today; d = addDaysYmd(d, 1)) {
+        if (d >= yest) continue;
+        const st = dayStatus(d, today);
+        if (st.state !== "complete" && !skipChecked(d)) gapDates.push(d);
+      }
+    }
+    if (!opts.fix) {
+      add(today, "recent");
+      add(yest, "recent");
+      // (a) from the day after the last complete day through today
+      let lastComplete = null;
+      for (let k = stored.length - 1; k >= 0; k--) {
+        if (stored[k] < yest && dayStatus(stored[k], today).state === "complete") { lastComplete = stored[k]; break; }
+      }
+      const aStart = lastComplete ? addDaysYmd(lastComplete, 1) : earliest ? null : winStart;
+      if (aStart) for (let d = today; d >= aStart && d >= winStart; d = addDaysYmd(d, -1)) {
+        const st = dayStatus(d, today);
+        if (d >= yest || st.state !== "complete") { if (!skipChecked(d) || d >= yest) add(d, earliest ? "new" : "first"); }
+      }
+    }
+    // (c) gaps and incomplete days inside the history window, newest first
+    for (let k = gapDates.length - 1; k >= 0; k--) add(gapDates[k], "gap");
+    // (d) backfill the next older 30-day block
+    let backfill = null;
+    if (!opts.fix && earliest && earliest > winStart) {
+      const bEnd = addDaysYmd(earliest, -1);
+      let bStart = addDaysYmd(earliest, -30);
+      if (bStart < winStart) bStart = winStart;
+      backfill = { start: bStart, end: bEnd };
+      for (let d = bEnd; d >= bStart; d = addDaysYmd(d, -1)) add(d, "backfill");
+    }
+    const taken = order.slice(0, cap);
+    const ranges = toRuns(taken);
+    return {
+      ranges,
+      days: taken.length,
+      wanted: order.length,
+      remaining: Math.max(0, order.length - taken.length),
+      capped: order.length > taken.length,
+      historyDays: hist,
+      backfill,
+      reasons: Object.fromEntries(taken.map((d) => [d, reasons[d]])),
+      earliest,
+    };
+  }
+  function syncPlan(today, opts) {
+    return syncPlanDetail(today, opts).ranges;
   }
   async function clearImported() {
     const months = new Set(Object.keys(S.health).map(monthOf));
@@ -10973,7 +11223,10 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
     rerender();
   }
   function exportJSON() {
-    const health = Object.values(S.health).sort((a, b) => (a.date < b.date ? -1 : 1));
+    const health = Object.values(S.health)
+      .filter(realDay)
+      .map((d) => { const { _sync, ...rest } = d; return rest; })
+      .sort((a, b) => (a.date < b.date ? -1 : 1));
     return {
       format: "cadence.v2",
       exportedAt: new Date().toISOString(),
@@ -11985,6 +12238,14 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
     ageOn,
     env,
     importDays,
+    markSync,
+    syncMeta,
+    syncPlan,
+    syncPlanDetail,
+    dayStatus,
+    coverageOf,
+    mergeDay,
+    historyChoices: HISTORY_CHOICES.slice(),
     clearImported,
     exportJSON,
     persistKind: () => S.persist,
@@ -12084,6 +12345,16 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
   }
   const head = (title, meta) => `<div class="card-head"><h2 class="section-title">${title}</h2>${meta ? `<div class="card-meta">${meta}</div>` : ""}</div>`;
   const chip = (level, text) => `<span class="chip ${level}">${text}</span>`;
+  /* why strain is blank or 0.0 (adapter strainReason "insufficient_hr_data" → no heart-rate data) */
+  const strainNote = (d) => {
+    if (!d) return "";
+    if (!isNum(d.strain)) return d.strainReason === "insufficient_hr_data" || d.strainReason == null ? "No heart-rate data for this day" : "";
+    return Math.round(d.strain * 10) === 0 ? "No minutes above your effort threshold" : "";
+  };
+  const strainTip = (d, html) => {
+    const t = strainNote(d);
+    return t ? `<span class="cv-tip" title="${esc(t)}">${html}</span>` : html;
+  };
   const strainPill = (v) => `<span class="pill cv-spill num" aria-label="Strain ${fStrain(v)}">${fStrain(v)}</span>`;
   const emptyCard = (title, text, cls) => `<div class="card ${cls || ""}"><div class="empty"><h2>${title}</h2><p class="muted">${text}</p></div></div>`;
   /** v4 dial (Charts.ring variant "dial"), with an aria label like "Recovery 62 %". */
@@ -12185,6 +12456,7 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
 .cv-wrow{display:flex;align-items:center;gap:12px}
 .cv-wmain{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 8px;min-width:0}
 .cv-wmeta{flex-basis:100%;font-size:13px}
+.cv-tip{display:contents}
 .cv-spill{min-width:3.4em;justify-content:center;text-align:center;font-family:var(--f-num);font-weight:700;color:#fff;background:var(--strain)}
 .cv-sep{color:var(--faint)}
 .metric-sub .delta{font-size:inherit}
@@ -12507,8 +12779,8 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
         C.scoreDial({ kind: "sleep", size: "md", value: isNum(perf) ? perf : null, view: "sleep", label: "Sleep" }) +
         C.scoreDial({ kind: "recovery", size: "md", value: isNum(rec) ? rec : null, color: bandColor(band), view: "recovery",
           aria: `Recovery ${isNum(rec) ? Math.round(rec) + " percent" + (band ? ", " + band : "") : "not scored"}. Open Recovery` }) +
-        C.scoreDial({ kind: "strain", size: "md", value: isNum(d.strain) ? d.strain : null, max: 21, view: "strain", target: ts ? [ts.lo, ts.hi] : null,
-          aria: `Strain ${fStrain(d.strain)} of 21. Open Strain` });
+        strainTip(d, C.scoreDial({ kind: "strain", size: "md", value: isNum(d.strain) ? d.strain : null, max: 21, view: "strain", target: ts ? [ts.lo, ts.hi] : null,
+          aria: `Strain ${fStrain(d.strain)} of 21${strainNote(d) ? ". " + strainNote(d) : ""}. Open Strain` }));
       const [hl] = headline(band);
       const lines = insights(ctx);
       const items = [{ title: hl, bodyHtml: lines[0] || "" }];
@@ -12738,8 +13010,10 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
       const ws = workoutsOf(d);
       const share = isNum(d.activityStrainShare) ? Math.round(d.activityStrainShare * 100) : null;
       const tgt = Array.isArray(d.strainTarget) && isNum(d.strainTarget[0]) && isNum(d.strainTarget[1]) ? d.strainTarget : null;
-      const hero = `<div class="dv-hero">${C.scoreDial({ kind: "strain", size: "lg", value: isNum(d.strain) ? d.strain : null, max: 21, target: tgt,
-        chip: today ? "So far" : "", aria: `Strain ${fStrain(d.strain)} of 21${today ? " so far" : ""}${tgt ? `, target ${fStrain(tgt[0])} to ${fStrain(tgt[1])}` : ""}` })}</div>`;
+      const sNote = strainNote(d);
+      const hero = `<div class="dv-hero">${strainTip(d, C.scoreDial({ kind: "strain", size: "lg", value: isNum(d.strain) ? d.strain : null, max: 21, target: tgt,
+        chip: today ? "So far" : "", caption: !isNum(d.strain) ? sNote : "",
+        aria: `Strain ${fStrain(d.strain)} of 21${today ? " so far" : ""}${tgt ? `, target ${fStrain(tgt[0])} to ${fStrain(tgt[1])}` : ""}${sNote ? ". " + sNote : ""}` }))}</div>`;
       const zl = (j) => { const zz = ctx.derived[j] && ctx.derived[j].zones; return Array.isArray(zz) ? (zz[1] || 0) + (zz[2] || 0) + (zz[3] || 0) : null; };
       const zh = (j) => { const zz = ctx.derived[j] && ctx.derived[j].zones; return Array.isArray(zz) ? (zz[4] || 0) + (zz[5] || 0) : null; };
       const lm = zMin[0] + zMin[1] + zMin[2], vp = zMin[3] + zMin[4];
@@ -16248,6 +16522,7 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
     confirmClear: false,
     downloads: undefined, // undefined = not checked, null = unavailable
     dlChecking: false,
+    checkSpan: 30, // Data check grid: 30 or 90 days
   };
 
   const UPLOAD = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 15V4M7.5 8.5L12 4l4.5 4.5"/><path d="M4 15v3.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V15"/></svg>';
@@ -16640,8 +16915,44 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
   }
 
   const ymdOf = (d) => window.CadenceEngine.ymd(d);
-  /* resolves {ok, days}; rejects with the error when the sync itself fails */
-  async function gSync(auto) {
+  const HIST = [30, 90, 180, 365];
+  const histDays = () => {
+    const n = +(g.cfg.historyDays != null ? g.cfg.historyDays : g.cfg.firstDays);
+    return HIST.includes(n) ? n : 90;
+  };
+  const addD = (date, n) => {
+    const d = window.CadenceEngine.parseYmd(date);
+    d.setDate(d.getDate() + n);
+    return ymdOf(d);
+  };
+  const datesOf = (ranges) => {
+    const out = [];
+    for (const r of ranges || []) for (let d = r.start; d <= r.end && out.length < 400; d = addD(d, 1)) out.push(d);
+    return out;
+  };
+  /* what to fetch: App.syncPlanDetail (sync v2) when present, else the old "since last sync" window */
+  function gPlan(opts) {
+    const today = ymdOf(new Date());
+    if (opts && Array.isArray(opts.ranges) && opts.ranges.length) return { ranges: opts.ranges, remaining: 0 };
+    if (typeof App.syncPlanDetail === "function") {
+      try {
+        const p = App.syncPlanDetail(today, { historyDays: histDays(), fix: !!(opts && opts.fix) });
+        if (p && Array.isArray(p.ranges)) return p;
+      } catch (e) {
+        console.warn("Cadence: sync plan failed", e);
+      }
+    }
+    let start = addD(today, -(histDays() - 1));
+    if (g.cfg.lastSync) {
+      const s = ymdOf(new Date(Date.parse(g.cfg.lastSync) - 2 * 864e5)); // 2-day overlap catches late data
+      if (s > start) start = s;
+    }
+    return { ranges: [{ start, end: today }], remaining: 0 };
+  }
+  const covOf = (d, cov) => (cov && cov[d.date]) || (App.coverageOf ? App.coverageOf(d) : undefined);
+  /* resolves {ok, days}; rejects with the error when the sync itself fails.
+   * opts: {fix} → only missing / incomplete days; {ranges} → exactly these */
+  async function gSync(auto, opts) {
     const gh = GH();
     if (!gh) return { ok: false, days: 0, skipped: "unavailable" };
     if (g.busy) return { ok: false, days: 0, skipped: "busy" };
@@ -16652,44 +16963,102 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
       try { valid = !!(typeof gh.tokenStatus === "function" && gh.tokenStatus() && gh.tokenStatus().valid); } catch (e) { valid = false; }
       if (!valid) return { ok: false, reason: "no_token" };
     }
+    const plan = gPlan(opts);
+    if (opts && opts.fix && !plan.ranges.length) {
+      g.msg = { ok: true, text: "No missing days to fix." };
+      App.rerender();
+      return { ok: true, count: 0, days: 0 };
+    }
+    const ranges = plan.ranges.length ? plan.ranges : [{ start: addD(ymdOf(new Date()), -1), end: ymdOf(new Date()) }];
+    const want = datesOf(ranges);
+    const wantSet = new Set(want);
+    const total = want.length;
+    const at = new Date().toISOString();
+    const saved = new Set();
+    let imported = 0;
+    let chain = Promise.resolve();
+    const E = window.CadenceEngine;
+    // import a batch with the smart merge; batches run one after another
+    const save = (list, cov) => {
+      const batch = (Array.isArray(list) ? list : []).filter((d) => d && d.date && !saved.has(d.date));
+      if (!batch.length) return chain;
+      for (const d of batch) saved.add(d.date);
+      chain = chain.then(async () => {
+        const clean = batch.map((d) => {
+          const c = E.cleanDay ? E.cleanDay(d) : d;
+          if (c) c._sync = { at, coverage: covOf(c, cov), failed: null, empty: null, checks: 0 };
+          return c;
+        }).filter(Boolean);
+        if (clean.length) imported += await App.importDays(clean, { merge: true });
+      }).catch((e) => console.error("Cadence: saving synced days failed", e));
+      return chain;
+    };
+    const label = (extra) => {
+      const x = Math.max(1, Math.min(total, [...saved].filter((d) => wantSet.has(d)).length || Math.round(((g.progress && g.progress.frac) || 0) * total)));
+      return total > 1 ? `Day ${x} of ${total}${extra ? " · " + extra : ""}` : extra || "Working…";
+    };
     let result = null, failure = null;
     g.busy = "sync";
     g.msg = null;
-    g.progress = { frac: null, label: "Starting…" };
+    g.progress = { frac: null, label: total > 1 ? `Day 1 of ${total}` : "Starting…" };
     if (!auto || App.view() === "data") App.rerender();
     try {
-      let days, since;
-      if (g.cfg.lastSync) {
-        const last = new Date(g.cfg.lastSync);
-        const s = new Date(last.getTime() - 2 * 864e5); // 2-day overlap catches late-arriving data
-        since = ymdOf(s);
-        days = Math.max(3, Math.min(180, Math.ceil((Date.now() - s.getTime()) / 864e5) + 1));
-      } else {
-        days = [30, 90, 180].includes(+g.cfg.firstDays) ? +g.cfg.firstDays : 90;
-      }
+      const start = ranges[0].start;
       const res = await gh.sync({
-        days,
-        since,
+        ranges,
+        since: start,
+        days: Math.max(1, Math.round((Date.parse(ymdOf(new Date()) + "T12:00:00") - Date.parse(start + "T12:00:00")) / 864e5) + 1),
         onProgress: (p) => {
-          g.progress = normProgress(p) || g.progress;
+          const n = normProgress(p) || g.progress;
+          g.progress = { frac: n.frac, label: "" };
+          g.progress.label = label(n.label && n.label !== "Starting" ? n.label : "");
           paintProgress();
         },
+        onDays: (list) => {
+          save(list, null);
+          if (g.progress) {
+            g.progress.label = label("");
+            paintProgress();
+          }
+        },
       });
-      const E = window.CadenceEngine;
-      const raw = (res && Array.isArray(res.days) ? res.days : []);
-      const clean = raw.map((d) => (E.cleanDay ? E.cleanDay(d) : d)).filter(Boolean);
-      const n = clean.length ? await App.importDays(clean, { merge: true }) : 0;
+      await chain;
+      await save(res && res.days, res && res.coverage);
+      const failed = Array.isArray(res && res.failedDays) ? res.failedDays.filter((d) => typeof d === "string") : [];
+      const failedSet = new Set(failed);
+      if (App.markSync) {
+        await App.markSync({
+          at,
+          failed,
+          empty: want.filter((d) => !saved.has(d) && !failedSet.has(d)),
+        });
+      }
+      const n = imported;
       g.cfg.lastSync = new Date().toISOString();
       g.cfg.lastCount = n;
       g.cfg.sources = Array.isArray(res && res.sources) ? res.sources.slice(0, 20) : [];
       g.cfg.warnings = Array.isArray(res && res.warnings) ? res.warnings.slice(0, 20) : [];
+      g.cfg.lastRun = { at: g.cfg.lastSync, ok: true, days: n, failed: failed.length, remaining: plan.remaining || 0 };
       gSave();
-      g.msg = { ok: true, text: n ? `Synced ${App.fmt.num(n)} day${n === 1 ? "" : "s"} from Google Health.` : "Synced. No new days in that range." };
+      const more = plan.remaining ? ` ${App.fmt.num(plan.remaining)} more day${plan.remaining === 1 ? "" : "s"} will come in on the next sync.` : "";
+      const bad = failed.length ? ` ${App.fmt.num(failed.length)} day${failed.length === 1 ? "" : "s"} didn't load. Fix missing days tries again.` : "";
+      g.msg = { ok: !failed.length, text: (n ? `Synced ${App.fmt.num(n)} day${n === 1 ? "" : "s"} from Google Health.` : "Synced. No new days in that range.") + bad + more };
       if (!auto) App.toast(n ? `Synced ${n} day${n === 1 ? "" : "s"}` : "Up to date");
-      result = { ok: true, count: n, days: n };
+      result = { ok: true, count: n, days: n, failedDays: failed };
     } catch (e) {
       failure = e || new Error("sync_failed");
-      g.msg = { ok: false, text: gErr(e) };
+      // keep everything fetched before the error; lastSync stays where it was
+      await chain;
+      const part = e && e.partial && typeof e.partial === "object" ? e.partial : null;
+      if (part) {
+        await save(part.days, part.coverage);
+        const failed = Array.isArray(part.failedDays) ? part.failedDays.filter((d) => typeof d === "string") : [];
+        if (failed.length && App.markSync) await App.markSync({ at, failed });
+      }
+      const kept = imported;
+      g.cfg.lastRun = { at: new Date().toISOString(), ok: false, days: kept, error: String((e && e.code) || "error") };
+      gSave();
+      g.msg = { ok: false, text: gErr(e) + (kept ? ` ${App.fmt.num(kept)} day${kept === 1 ? " was" : "s were"} saved before it stopped.` : "") };
       if (e && /^(token_expired|unauthorized|auth|not_connected)$/.test(String(e.code || ""))) await gRefresh();
     }
     g.busy = null;
@@ -16761,9 +17130,77 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
     const n = +el.dataset.n;
     if (![30, 90, 180].includes(n)) return;
     g.cfg.firstDays = n;
+    g.cfg.historyDays = n;
     gSave();
     App.rerender();
   });
+  App.on("gh:fix", () => gSync(false, { fix: true }).catch(() => {}));
+  App.onInput("gh:history", (el) => {
+    const n = +el.value;
+    if (!HIST.includes(n)) return;
+    g.cfg.historyDays = n;
+    gSave();
+    App.toast(`Cadence keeps ${n} days of history`);
+    App.rerender();
+  });
+  App.on("dc:span", (el) => {
+    const n = +el.dataset.n;
+    if (n !== 30 && n !== 90) return;
+    st.checkSpan = n;
+    App.rerender();
+  });
+
+  /* ---------- Data check: which days are complete, partial or missing ---------- */
+  const REASON = { no_hr: "no heart rate", short_wear: "short wear", no_sleep: "no sleep", sync_failed: "sync failed" };
+  function dataCheckCard() {
+    if (typeof App.dayStatus !== "function") return "";
+    const connected = isWeb() && GH() && g.cfg.clientId;
+    if (App.mode() !== "mine" && !connected) return "";
+    const today = ymdOf(new Date());
+    const span = st.checkSpan === 90 ? 90 : 30;
+    const cells = [];
+    const n = { complete: 0, partial: 0, missing: 0 };
+    const problems = [];
+    for (let k = span - 1; k >= 0; k--) {
+      const date = addD(today, -k);
+      let s;
+      try { s = App.dayStatus(date, today) || {}; } catch (e) { s = {}; }
+      const state = s.state === "complete" || s.state === "partial" ? s.state : "missing";
+      n[state]++;
+      const why = state === "partial" ? REASON[s.reason] || "incomplete" : state === "missing" && s.reason === "sync_failed" ? "sync failed" : "";
+      const label = `${App.fmt.day(date)}: ${state}${why ? ", " + why : ""}${date === today ? " (today)" : ""}`;
+      if (state !== "complete" && date !== today) problems.push({ date, state, why });
+      cells.push(`<span class="dc-c dc-${state}${date === today ? " dc-today" : ""}" title="${esc(label)}" role="listitem" aria-label="${esc(label)}"></span>`);
+    }
+    let plan = null;
+    try { plan = typeof App.syncPlanDetail === "function" ? App.syncPlanDetail(today, { historyDays: histDays() }) : null; } catch (e) { plan = null; }
+    let fixable = 0;
+    try { fixable = typeof App.syncPlanDetail === "function" ? App.syncPlanDetail(today, { historyDays: histDays(), fix: true }).wanted || 0 : 0; } catch (e) { fixable = 0; }
+    const hist = histDays();
+    let older;
+    if (!plan || !plan.earliest) older = "Older history comes in after your first sync.";
+    else if (plan.backfill) older = `Next sync fetches ${App.fmt.short(plan.backfill.start)} – ${App.fmt.short(plan.backfill.end)}, working back to ${hist} days.`;
+    else older = `History goes back to ${App.fmt.short(plan.earliest)}. That covers your ${hist}-day window.`;
+    if (plan && plan.capped && plan.remaining) older += ` ${App.fmt.num(plan.remaining)} day${plan.remaining === 1 ? "" : "s"} wait for a later sync (45 per sync).`;
+    const list = problems.slice(-5).reverse().map((p) => `<li><span class="num">${esc(App.fmt.day(p.date))}</span><span class="muted">${esc(p.state === "missing" ? p.why || "missing" : p.why)}</span></li>`).join("");
+    const busy = !!g.busy;
+    const fixBtn = connected && g.connected
+      ? `<button class="btn" type="button" data-action="gh:fix"${busy || !fixable ? " disabled" : ""}>${busy === "sync" ? "Syncing…" : "Fix missing days"}</button>`
+      : "";
+    const opts = HIST.map((d) => `<option value="${d}"${d === hist ? " selected" : ""}>${d} days</option>`).join("");
+    return `<div class="card dc" id="data-check">
+      <div class="card-head"><h2>Data check</h2><div class="seg" role="group" aria-label="Days shown">${[30, 90].map((d) => `<button type="button" data-action="dc:span" data-n="${d}" class="${span === d ? "on" : ""}" aria-pressed="${span === d}">${d} days</button>`).join("")}</div></div>
+      <div class="dc-grid" role="list" aria-label="Last ${span} days, oldest first">${cells.join("")}</div>
+      <div class="dc-key">
+        <span><i class="dc-c dc-complete" aria-hidden="true"></i>Complete <b class="num">${n.complete}</b></span>
+        <span><i class="dc-c dc-partial" aria-hidden="true"></i>Partial <b class="num">${n.partial}</b></span>
+        <span><i class="dc-c dc-missing" aria-hidden="true"></i>Missing <b class="num">${n.missing}</b></span>
+      </div>
+      ${list ? `<ul class="dc-list" aria-label="Recent days with gaps">${list}</ul>` : `<p class="muted">Every day in this range has heart rate, sleep and steps.</p>`}
+      ${connected ? `<div class="btn-row dc-row">${fixBtn}<label class="field dc-hist"><span>Keep history for</span><select data-input="gh:history" aria-label="History depth">${opts}</select></label></div>
+      <p class="note">${esc(older)}</p>` : ""}
+    </div>`;
+  }
   App.on("gh:disconnect", async () => {
     const gh = GH();
     try {
@@ -16840,7 +17277,7 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
         <div class="gh-last"><div class="stat-label">Last sync</div><div class="gh-last-v num">${esc(lastTxt)}</div>${c.lastSync ? `<div class="small muted num">${App.fmt.num(c.lastCount || 0)} days updated</div>` : ""}</div>
       </div>
       <p class="muted">${g.connected
-        ? c.lastSync ? "Sync now fetches everything since your last sync, plus the two days before it to catch late data." : "Connected. Choose how much history to bring in, then sync."
+        ? c.lastSync ? "Sync now fetches new days, refreshes today and yesterday, and fills gaps in your history." : "Connected. Choose how much history to bring in, then sync."
         : "Sign in with Google to let Cadence read your health data. Google shows exactly what's shared."}</p>
       ${range}
       <div class="btn-row gh-actions">${buttons}</div>
@@ -16920,6 +17357,20 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
 .gh-warn ul{margin:.4em 0 0;padding-left:1.2em}
 .gh-auto{display:flex;gap:10px;align-items:flex-start;cursor:pointer;line-height:1.4}
 .gh-auto input{margin-top:3px;width:18px;height:18px;accent-color:var(--accent)}
+.dc-grid{display:grid;grid-template-columns:repeat(15,1fr);gap:4px;margin:4px 0 10px}
+.dc-c{display:block;aspect-ratio:1;border-radius:4px;background:var(--faint,var(--line,#8884));min-width:0}
+.dc-key .dc-c{display:inline-block;width:10px;height:10px;aspect-ratio:auto;margin-right:6px;vertical-align:-1px}
+.dc-complete{background:var(--green)}
+.dc-partial{background:var(--warning,#e0a030)}
+.dc-missing{background:transparent;box-shadow:inset 0 0 0 1.5px var(--faint,var(--muted))}
+.dc-today{outline:2px solid var(--accent);outline-offset:1px}
+.dc-key{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:13px;color:var(--muted)}
+.dc-key b{color:var(--text,inherit);margin-left:4px}
+.dc-list{list-style:none;margin:10px 0 0;padding:0;display:flex;flex-direction:column;gap:4px;font-size:14px}
+.dc-list li{display:flex;justify-content:space-between;gap:12px}
+.dc .card-head{flex-wrap:wrap;gap:8px}
+.dc-row{align-items:flex-end;flex-wrap:wrap;margin-top:12px}
+.dc-hist{flex:1 1 160px;max-width:220px}
 .linkish{background:none;border:0;padding:0;color:var(--accent);font:inherit;text-decoration:underline;cursor:pointer}`,
     render(ctx) {
       checkDownloads();
@@ -16932,7 +17383,7 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
       return `<div class="page">
         ${dpHero}
         <div class="grid-2">
-          <div class="stack">${isWeb() ? googleCard() : ""}${sourceCard(ctx)}${importCard()}${backupCard()}</div>
+          <div class="stack">${isWeb() ? googleCard() : ""}${dataCheckCard()}${sourceCard(ctx)}${importCard()}${backupCard()}</div>
           <div class="stack">${phoneCard()}${profileCard(ctx)}</div>
         </div>
         ${methodsCard(ctx)}
@@ -17059,9 +17510,29 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
     { id: "total-calories", chunkDays: 14 },
   ];
   // intraday steps: rollUp in 5-minute windows (14 days = 4,032 windows per call; API max range 90 days)
-  const STEPS5 = { id: "steps", key: "steps5", chunkDays: 14, windowSize: "300s", pageSize: 5000, optional: true };
+  // (sync v2: chunks are also cut at segment edges, so in practice ≤ SEG_DAYS = 5,184 windows → one page)
+  const STEPS5 = { id: "steps", key: "steps5", chunkDays: 30, windowSize: "300s", pageSize: 10000, optional: true };
   // fallback: raw steps interval points via list
   const STEPS_LIST = { id: "steps", kind: "interval", pageSize: 10000, chunkDays: 3, optional: true };
+  // sync v2 heart rate: rollUp in 60 s windows (heart-rate supports rollUp; max range 14 days, pageSize ≤ 10000).
+  // 6 days = 8,640 windows → one page. If Google rejects it (400/404) we list raw samples in 3-day chunks instead.
+  //   https://developers.google.com/health/reference/rest/v4/users.dataTypes.dataPoints/rollUp
+  //   https://developers.google.com/health/reference/rest/v4/HeartRateRollupValue
+  const HR60 = { id: "heart-rate", key: "heart-rate", chunkDays: 6, windowSize: "60s", pageSize: 10000 };
+  const HR_LIST = LIST_TYPES.find((t) => t.id === "heart-rate");
+  // module flag (like stepsListMode, but kept across syncs): "rollup" until Google rejects the 60 s heart-rate rollUp
+  let hrMode = "rollup";
+  // optional detail sample types skipped for days older than DETAIL_RECENT_DAYS in incremental (since/ranges) syncs;
+  // the daily summaries still give those days hrv/spo2
+  const DETAIL_IDS = ["heart-rate-variability", "oxygen-saturation"];
+  const DETAIL_RECENT_DAYS = 3;
+  // fetched per segment (progressive onDays emission); everything else is cheap and fetched once per date run
+  const SEG_IDS = ["sleep", "exercise", "heart-rate", "heart-rate-variability", "oxygen-saturation"];
+  const SEG_DAYS = 18;
+  const CONCURRENCY = 4;
+  const CHUNK_RETRY_MS = 1500;
+  const FATAL = ["auth", "cors", "not_enabled", "network", "rate_limited"];
+  const TYPE_WIDE = ["forbidden", "not_found"]; // the whole data type is unavailable: retrying other chunks will not help
 
   /* ---------- small utils ---------- */
   const isNum = (v) => typeof v === "number" && isFinite(v);
@@ -17231,9 +17702,26 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
     const inWindow = (date) => (!opts.start || date >= opts.start) && (!opts.end || date <= opts.end);
     const list = (id) => (Array.isArray(raw[id]) ? raw[id] : []);
 
+    /* ---- heart rate: 1-minute rollUp windows (raw.hr60, sync v2) ---- */
+    // [startMs, avgBpm, durationMs, maxBpm]; an unset heartRate value means the device was not worn
+    const rolledMap = new Map();
+    for (const rp of Array.isArray(raw.hr60) ? raw.hr60 : []) {
+      const a = tms(rp && rp.startTime), b = tms(rp && rp.endTime);
+      const v = rp && rp.heartRate;
+      const avg = v ? num(v.beatsPerMinuteAvg) : undefined;
+      if (!isNum(a) || !isNum(b) || b <= a || b - a > 5 * MIN || avg === undefined || avg < 25 || avg > 240) continue;
+      let mx = v ? num(v.beatsPerMinuteMax) : undefined;
+      if (mx === undefined || mx < avg || mx > 240) mx = avg;
+      rolledMap.set(a, [a, avg, b - a, mx]);
+    }
+    const rolled = [...rolledMap.values()].sort((a, b) => a[0] - b[0]);
+    const rolledDates = new Set(rolled.map((r) => localInfo(r[0], tz).date));
+    const ROLL_MAXW = rolled.reduce((m, r) => Math.max(m, r[2]), 0);
+
     /* ---- heart rate samples (deduped by instant, sorted) ---- */
+    // raw.hrWorkout: full-resolution samples listed only around workouts (when the day itself came from the rollUp)
     const hrMap = new Map();
-    for (const dp of list("heart-rate")) {
+    for (const dp of list("heart-rate").concat(list("hrWorkout"))) {
       const p = payload(dp, "heart-rate");
       const t = sampleMs(p);
       const bpm = num(p && p.beatsPerMinute);
@@ -17261,7 +17749,7 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
       for (let i = 0; i < hr.length; i++) {
         const [t, bpm] = hr[i];
         const li = localInfo(t, tz);
-        if (!inWindow(li.date)) continue;
+        if (!inWindow(li.date) || rolledDates.has(li.date)) continue; // a rolled-up day uses its 1-min windows
         let pd = perDay.get(li.date);
         if (!pd) perDay.set(li.date, (pd = { counts: new Array(HIST_N).fill(0), bins: new Map() }));
         const w = Math.min(hrW[i] / MIN, Math.max(0, 1440 - li.min)); // do not spill past midnight
@@ -17275,6 +17763,20 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
         if (!pd.bins1.has(m1)) pd.bins1.set(m1, []);
         pd.bins1.get(m1).push(bpm);
       }
+      // 1-minute rollUp windows: hr1 = the minute mean, hr = median of the minute means, hrHist = window minutes
+      for (const [a, avg, dur] of rolled) {
+        const li = localInfo(a, tz);
+        if (!inWindow(li.date)) continue;
+        let pd = perDay.get(li.date);
+        if (!pd) perDay.set(li.date, (pd = { counts: new Array(HIST_N).fill(0), bins: new Map(), bins1: new Map() }));
+        histAdd(pd.counts, avg, Math.min(dur / MIN, Math.max(0, 1440 - li.min)));
+        const b = Math.floor(li.min / 5) * 5;
+        if (!pd.bins.has(b)) pd.bins.set(b, []);
+        pd.bins.get(b).push(avg);
+        const m1 = Math.floor(li.min);
+        if (!pd.bins1.has(m1)) pd.bins1.set(m1, []);
+        pd.bins1.get(m1).push(avg);
+      }
       for (const [date, pd] of perDay) {
         const d = day(date);
         d.hr = [...pd.bins.entries()].sort((a, b) => a[0] - b[0]).map(([m, v]) => [m, Math.round(median(v))]);
@@ -17283,10 +17785,41 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
         if (h) d.hrHist = h;
       }
     }
-    // stats for a time range [a, b)
-    function hrRange(a, b) {
+    // rolled windows overlapping [a, b): first index
+    function rolledFrom(a) {
+      let lo = 0, hi = rolled.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (rolled[mid][0] < a - ROLL_MAXW) lo = mid + 1;
+        else hi = mid;
+      }
+      while (lo < rolled.length && rolled[lo][0] + rolled[lo][2] <= a) lo++;
+      return lo;
+    }
+    // stats for [a, b) from 1-minute windows (each weighted by its overlap with the range)
+    function rolledRange(a, b) {
       const counts = new Array(HIST_N).fill(0);
       let wSum = 0, bSum = 0, max = 0;
+      for (let i = rolledFrom(a); i < rolled.length && rolled[i][0] < b; i++) {
+        const [t, avg, dur, mx] = rolled[i];
+        const w = (Math.min(b, t + dur) - Math.max(a, t)) / MIN;
+        if (!(w > 0)) continue;
+        histAdd(counts, avg, w);
+        wSum += w;
+        bSum += w * avg;
+        if (mx > max) max = Math.round(mx);
+      }
+      return wSum > 0 ? { hist: histOut(counts), avg: bSum / wSum, max, minutes: wSum } : null;
+    }
+    // stats for a time range [a, b): full-resolution samples when there are at least two, else 1-minute windows
+    function hrRange(a, b) {
+      const f = fineRange(a, b);
+      if (f && f.n >= 2) return f;
+      return rolledRange(a, b) || f;
+    }
+    function fineRange(a, b) {
+      const counts = new Array(HIST_N).fill(0);
+      let wSum = 0, bSum = 0, max = 0, n = 0;
       // binary search first sample ≥ a
       let lo = 0, hi = hr.length;
       while (lo < hi) {
@@ -17300,8 +17833,9 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
         wSum += w;
         bSum += w * hr[i][1];
         if (hr[i][1] > max) max = hr[i][1];
+        n++;
       }
-      return wSum > 0 ? { hist: histOut(counts), avg: bSum / wSum, max, minutes: wSum } : null;
+      return wSum > 0 ? { hist: histOut(counts), avg: bSum / wSum, max, minutes: wSum, n } : null;
     }
     function hrFrom(a) {
       let lo = 0, hi = hr.length;
@@ -17316,7 +17850,11 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
     function hrAfterOf(b) {
       const out = [];
       for (let i = hrFrom(b); i < hr.length && hr[i][0] <= b + 180000 && out.length < 2000; i++) out.push([r1((hr[i][0] - b) / 1000), hr[i][1]]);
-      return out.length >= 2 ? out : undefined;
+      if (out.length >= 2) return out;
+      // 1-minute windows: one point per window, at its start (0 for the window holding the end)
+      const ro = [];
+      for (let i = rolledFrom(b); i < rolled.length && rolled[i][0] <= b + 180000; i++) ro.push([r1(Math.max(0, rolled[i][0] - b) / 1000), Math.round(rolled[i][1])]);
+      return ro.length >= 2 ? ro : undefined;
     }
     // in-workout series: median per 15 s bucket (wider buckets if needed to stay ≤ 2000 points)
     function hrSeriesOf(a, b) {
@@ -17326,6 +17864,15 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
         const k = Math.floor((hr[i][0] - a) / 1000 / bs);
         if (!bins.has(k)) bins.set(k, []);
         bins.get(k).push(hr[i][1]);
+      }
+      if (bins.size < 2) {
+        // no full-resolution samples here: use the 1-minute windows that overlap the workout
+        bins.clear();
+        for (let i = rolledFrom(a); i < rolled.length && rolled[i][0] < b; i++) {
+          const k = Math.floor(Math.max(0, rolled[i][0] - a) / 1000 / bs);
+          if (!bins.has(k)) bins.set(k, []);
+          bins.get(k).push(rolled[i][1]);
+        }
       }
       const out = [...bins.entries()].sort((u, v) => u[0] - v[0]).map(([k, v]) => [k * bs, Math.round(median(v))]);
       return out.length >= 2 ? out : undefined;
@@ -17827,6 +18374,7 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
       state.clientId = id;
       state.restoredClientId = "";
     }
+    if (cfg.qps === null || (isNum(cfg.qps) && cfg.qps > 0 && cfg.qps <= 5)) state.qps = cfg.qps || undefined; // ≤ documented 5 QPS per user
     if (typeof cfg.proxyUrl === "string") state.proxyUrl = cfg.proxyUrl.trim().replace(/\/+$/, "");
     if (typeof cfg.helperUrl === "string") {
       const h = cfg.helperUrl.trim().replace(/\/+$/, "");
@@ -18119,18 +18667,47 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
   }
 
   const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
-  // Unverified (testing-mode) apps get ~2.5 requests/s per user; stay under it.
-  // https://developers.google.com/health/rate-limits
-  const MIN_GAP_MS = 450;
-  let nextSlot = 0;
-  async function throttle() {
-    const now = Date.now();
-    const at = Math.max(now, nextSlot);
-    nextSlot = at + (state.minGapMs !== undefined ? state.minGapMs : MIN_GAP_MS);
-    if (at > now) await sleepMs(at - now);
+  // Per-user quota (https://developers.google.com/health/rate-limits): 300 requests/minute (5 QPS) for
+  // standard apps; unverified apps are capped at 2.5 QPS per user. Token bucket a little under 2.5/s with a
+  // small burst (any 60 s window stays ≤ 147 requests < 150). configure({ qps }) raises it for verified apps.
+  // Legacy knob: state.minGapMs (0 = no throttle, used by tests; >0 = fixed gap).
+  const DEFAULT_QPS = 2.4, BURST = 3;
+  const bucket = { tokens: BURST, at: 0 };
+  // Waiting requests get tokens by priority (lower first; the sync passes its segment index, 0 = newest days),
+  // then in arrival order, so the newest days finish first while older ones still use the spare capacity.
+  const waiters = [];
+  let waitSeq = 0;
+  async function throttle(prio) {
+    const gap = state.minGapMs;
+    if (gap === 0) return;
+    const rate = isNum(gap) && gap > 0 ? 1000 / gap : isNum(state.qps) && state.qps > 0 ? state.qps : DEFAULT_QPS;
+    const burst = isNum(gap) && gap > 0 ? 1 : BURST;
+    const me = { prio: isNum(prio) ? prio : 0, seq: waitSeq++ };
+    waiters.push(me);
+    try {
+      for (;;) {
+        const now = Date.now();
+        bucket.tokens = Math.min(burst, bucket.tokens + (Math.max(0, now - bucket.at) * rate) / 1000);
+        bucket.at = now;
+        let first = waiters[0];
+        for (const w of waiters) if (w.prio < first.prio || (w.prio === first.prio && w.seq < first.seq)) first = w;
+        if (bucket.tokens >= 1 && first === me) {
+          bucket.tokens -= 1;
+          return;
+        }
+        await sleepMs(bucket.tokens >= 1 ? 2 : Math.max(1, Math.ceil(((1 - bucket.tokens) * 1000) / rate)));
+      }
+    } finally {
+      waiters.splice(waiters.indexOf(me), 1);
+    }
   }
+  // after a 429: empty the bucket so every worker slows down, not only the one that was refused
+  const drainBucket = () => {
+    bucket.tokens = Math.min(bucket.tokens, -1);
+    bucket.at = Date.now();
+  };
 
-  async function request(method, path, query, body) {
+  async function request(method, path, query, body, prio) {
     const base = state.proxyUrl || API_HOST;
     const qs = query ? Object.entries(query).filter(([, v]) => v !== undefined && v !== "").map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&") : "";
     const url = `${base}${path}${qs ? "?" + qs : ""}`;
@@ -18138,7 +18715,7 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
     if (body) headers["Content-Type"] = "application/json";
     let attempt = 0;
     for (;;) {
-      await throttle();
+      await throttle(prio);
       let res;
       try {
         res = await (root.fetch || fetch)(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
@@ -18160,6 +18737,7 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
       const msg = String(err.message || "");
       const reasons = JSON.stringify(err.details || []);
       if ((res.status === 429 || res.status >= 500) && attempt < 5) {
+        if (res.status === 429) drainBucket();
         const ra = Number(res.headers && res.headers.get && res.headers.get("Retry-After"));
         await sleepMs(isNum(ra) && ra > 0 ? Math.min(ra, 60) * 1000 : 1000 * 2 ** attempt + Math.random() * 500);
         attempt++;
@@ -18181,9 +18759,13 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
       if (/SERVICE_DISABLED|has not been used|is disabled|accessNotConfigured/i.test(msg + reasons)) throw GHError("not_enabled", MSG.not_enabled, msg);
       if (/ACCOUNT_NOT_LINKED/i.test(msg + reasons)) throw GHError("not_enabled", MSG.not_linked, msg);
       if (res.status === 403) throw GHError("forbidden", MSG.forbidden, msg);
-      if (res.status >= 500) throw GHError("network", "Google Health had a server problem. Try again in a few minutes.", msg);
+      // sync v2: a server error that outlasts the retries fails only this chunk (sync() retries/splits it;
+      // several in a row become a fatal "network" error there)
+      if (res.status >= 500) throw GHError("server", "Google Health had a server problem. Try again in a few minutes.", msg);
       if (res.status === 404) throw GHError("not_found", `Google Health does not offer this data here (404). ${msg}`.trim(), msg);
-      throw GHError(res.status === 400 && status === "INVALID_ARGUMENT" ? "bad_request" : "network", `Google Health rejected the request (${res.status}). ${msg}`.trim(), msg);
+      const e4 = GHError(res.status === 400 ? "bad_request" : "rejected", `Google Health rejected the request (${res.status}). ${msg}`.trim(), msg);
+      if (status) e4.status = status;
+      throw e4;
     }
   }
 
@@ -18210,8 +18792,9 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
   }
 
   // GET list with pagination for [startYmd, endYmd) chunk
-  async function listChunk(t, startYmd, endYmd, tz) {
-    const startMs = midnightMs(startYmd, tz), endMs = midnightMs(endYmd, tz);
+  // msRange [a, b) overrides the day bounds (sample/interval kinds only; used for per-workout HR)
+  async function listChunk(t, startYmd, endYmd, tz, msRange, prio) {
+    const startMs = msRange ? msRange[0] : midnightMs(startYmd, tz), endMs = msRange ? msRange[1] : midnightMs(endYmd, tz);
     const pts = [];
     let filter = filterFor(t, startMs, endMs, startYmd, endYmd);
     let token = "";
@@ -18219,7 +18802,7 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
     for (let page = 0; page < 2000; page++) {
       let j;
       try {
-        j = await request("GET", DT(t.id), { pageSize: t.pageSize, pageToken: token, filter: unfiltered ? "" : filter });
+        j = await request("GET", DT(t.id), { pageSize: t.pageSize, pageToken: token, filter: unfiltered ? "" : filter }, undefined, prio);
       } catch (e) {
         // If Google rejects our filter syntax, fall back to unfiltered paging (newest first) and stop
         // once we are past the window.
@@ -18252,7 +18835,7 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
     return sampleMs(p);
   }
 
-  async function rollupChunk(id, startYmd, endYmd) {
+  async function rollupChunk(id, startYmd, endYmd, prio) {
     const pts = [];
     let token = "";
     for (let page = 0; page < 100; page++) {
@@ -18262,7 +18845,7 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
         pageSize: 1000,
       };
       if (token) body.pageToken = token;
-      const j = await request("POST", `${DT(id)}:dailyRollUp`, null, body);
+      const j = await request("POST", `${DT(id)}:dailyRollUp`, null, body, prio);
       if (Array.isArray(j.rollupDataPoints)) pts.push(...j.rollupDataPoints);
       token = j.nextPageToken || "";
       if (!token) break;
@@ -18270,18 +18853,20 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
     return pts;
   }
 
-  // intraday rollUp: 5-minute windows from local midnight of startYmd, ending at endYmd's midnight or now
-  async function rollup5Chunk(t, startYmd, endYmd, tz) {
+  // intraday rollUp: windowSize windows from local midnight of startYmd, ending at endYmd's midnight or now
+  // (steps: 300 s; heart-rate: 60 s — heart-rate rollUp range is at most 14 days)
+  async function rollup5Chunk(t, startYmd, endYmd, tz, prio) {
     const iso = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+    const ws = Number(String(t.windowSize).replace(/s$/, "")) * 1000 || 300000;
     const a = midnightMs(startYmd, tz);
-    const b = Math.min(midnightMs(endYmd, tz), Math.ceil(Date.now() / 300000) * 300000);
+    const b = Math.min(midnightMs(endYmd, tz), a + Math.ceil((Date.now() - a) / ws) * ws);
     if (b <= a) return [];
     const pts = [];
     let token = "";
     for (let page = 0; page < 100; page++) {
       const body = { range: { startTime: iso(a), endTime: iso(b) }, windowSize: t.windowSize, pageSize: t.pageSize };
       if (token) body.pageToken = token;
-      const j = await request("POST", `${DT(t.id)}:rollUp`, null, body);
+      const j = await request("POST", `${DT(t.id)}:rollUp`, null, body, prio);
       if (Array.isArray(j.rollupDataPoints)) pts.push(...j.rollupDataPoints);
       token = j.nextPageToken || "";
       if (!token) break;
@@ -18312,8 +18897,19 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
   }
 
   /**
-   * sync({ days = 90, since: "YYYY-MM-DD", onProgress(info), tz })
-   * → { days, sources: [{type, points, status, message?}], warnings }
+   * sync(opts) → { days, sources: [{type, points, status, message?}], warnings, range, failedDays, coverage }
+   *   opts.ranges  [{start, end, full?}] inclusive local dates (sync v2). Only these dates are emitted; each date
+   *                run also fetches the day before (overnight sleep / in-sleep samples). full:true also fetches the
+   *                HRV/SpO2 detail samples for that range's older days (normally skipped in incremental syncs).
+   *   opts.days / opts.since  as before: one run from start through today (used when ranges is absent).
+   *   opts.onProgress({ done, total, fraction, label, daysDone, daysTotal })
+   *   opts.onDays(days)  mapped days of each finished segment (≤ 18 days), as soon as every type for those dates
+   *                is done. Newest segment first. Promises it returns are awaited before sync() resolves.
+   *   opts.tz
+   * A chunk that fails is retried, then split in halves once; dates still missing a required type go to
+   * failedDays and the sync carries on. Fatal errors (auth/cors/not_enabled/network/rate_limited) throw with
+   * err.partial = { days, failedDays, sources, warnings, coverage } built from every date whose required types
+   * all finished. coverage[date] = { hrMinutes, sleep, workouts, steps } for every requested date that was settled.
    */
   async function sync(opts) {
     opts = opts || {};
@@ -18323,89 +18919,415 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
       if (!r || !r.ok) await connect();
     }
     const today = localInfo(Date.now(), tz).date;
-    const nDays = Math.max(1, Math.min(365, Math.round(opts.days || 90)));
-    let start = typeof opts.since === "string" && /^\d{4}-\d{2}-\d{2}$/.test(opts.since) ? opts.since : addDays(today, -(nDays - 1));
-    if (start > today) start = today;
-    const endExcl = addDays(today, 1);
-    // fetch one extra day back so a night that started the evening before is complete
-    const fetchStart = addDays(start, -1);
+    const YMD = /^\d{4}-\d{2}-\d{2}$/;
+    const isYmd = (s) => typeof s === "string" && YMD.test(s);
+    const datesOf = (a, bExcl) => {
+      const out = [];
+      for (let d = a; d < bExcl && out.length < 1000; d = addDays(d, 1)) out.push(d);
+      return out;
+    };
 
-    const raw = { rollups: {} };
+    /* ---- 1. requested dates → merged date runs ---- */
+    let req = [];
+    const incremental = Array.isArray(opts.ranges) || isYmd(opts.since);
+    if (Array.isArray(opts.ranges)) {
+      for (const r of opts.ranges) {
+        if (!r || !isYmd(r.start) || (r.end !== undefined && !isYmd(r.end))) continue;
+        let a = r.start, b = r.end || r.start;
+        if (b > today) b = today;
+        if (a > b) continue;
+        req.push({ start: a, end: b, full: !!r.full });
+      }
+    } else {
+      const nDays = Math.max(1, Math.min(365, Math.round(opts.days || 90)));
+      let start = isYmd(opts.since) ? opts.since : addDays(today, -(nDays - 1));
+      if (start > today) start = today;
+      req.push({ start, end: today, full: false });
+    }
+    req.sort((u, v) => (u.start < v.start ? -1 : u.start > v.start ? 1 : 0));
+    const want = new Set(), fullDates = new Set();
+    for (const r of req) for (const d of datesOf(r.start, addDays(r.end, 1))) {
+      want.add(d);
+      if (r.full) fullDates.add(d);
+    }
+    // safety cap: newest 400 dates
+    const wantList = [...want].sort();
+    while (wantList.length > 400) want.delete(wantList.shift());
     const sources = [];
     const warnings = [];
-    const tasks = [];
-    const plan = [];
-    for (const t of LIST_TYPES) for (const [a, b] of chunks(fetchStart, endExcl, t.chunkDays)) plan.push({ kind: "list", t, a, b });
-    for (const t of ROLLUP_TYPES) for (const [a, b] of chunks(start, endExcl, t.chunkDays)) plan.push({ kind: "rollup", t, a, b });
-    for (const [a, b] of chunks(start, endExcl, STEPS5.chunkDays)) plan.push({ kind: "rollup5", t: STEPS5, a, b });
-    const status = new Map(); // id → {type, points, status, message}
-    const failed = new Set();
-    let done = 0;
-    const report = (label) => {
+    if (!wantList.length) return { days: [], sources, warnings, range: null, failedDays: [], coverage: {} };
+    // fetch runs: each requested run plus the day before; runs that touch (or are one day apart) merge
+    const runs = [];
+    {
+      let cur = null;
+      for (const d of wantList) {
+        if (cur && d <= addDays(cur.e, 2)) cur.e = d;
+        else runs.push((cur = { s: d, e: d }));
+      }
+      for (const r of runs) {
+        r.fs = addDays(r.s, -1);
+        r.ex = addDays(r.e, 1);
+      }
+    }
+
+    /* ---- 2. segments (emission units), newest first ---- */
+    const segs = [];
+    for (const run of runs) {
+      for (let sb = run.ex; sb > run.fs; ) {
+        let sa = addDays(sb, -SEG_DAYS);
+        if (sa < run.fs) sa = run.fs;
+        segs.push({ a: sa, b: sb, run, dates: datesOf(sa, sb).filter((d) => want.has(d)), pending: 0, reqTotal: 0, reqDone: 0, aborted: false, emitted: false, deps: [] });
+        sb = sa;
+      }
+    }
+    segs.sort((u, v) => (u.b > v.b ? -1 : 1));
+
+    /* ---- 3. jobs ---- */
+    const raw = { rollups: {} };
+    const jobs = [];
+    const detailCutoff = addDays(today, -DETAIL_RECENT_DAYS);
+    const rolledFetched = new Set(); // dates whose heart rate came from the 60 s rollUp
+    let stepsListMode = false; // set when the 5-minute rollUp is rejected; later chunks then use list
+    const addJob = (j, onlySeg) => {
+      j.sk = j.sk || j.t.key || j.t.id;
+      // per-segment jobs start one day early (see p0 below), so a segment never waits on its older neighbour
+      j.segs = onlySeg ? [onlySeg] : segs.filter((s) => s.run === j.run && addDays(s.a, -1) < j.b && s.b > j.a);
+      for (const s of j.segs) {
+        s.pending++;
+        if (!j.t.optional) s.reqTotal++;
+      }
+      j.settled = new Promise((r) => (j.resolve = r));
+      jobs.push(j);
+      return j;
+    };
+    const listFetch = (t) => async (a, b, prio) => [[t.id, await listChunk(t, a, b, tz, undefined, prio)]];
+    for (const run of runs) {
+      for (const t of LIST_TYPES) {
+        if (SEG_IDS.includes(t.id)) continue;
+        for (const [a, b] of chunks(run.fs, run.ex, t.chunkDays)) addJob({ kind: "list", t, run, a, b, fetch: listFetch(t), split: true });
+      }
+      for (const t of ROLLUP_TYPES) {
+        for (const [a, b] of chunks(run.s, run.ex, t.chunkDays)) addJob({ kind: "rollup", t, run, a, b, fetch: async (x, y, prio) => [["rollups:" + t.id, await rollupChunk(t.id, x, y, prio)]], split: true });
+      }
+    }
+    const typeOf = (id) => LIST_TYPES.find((t) => t.id === id);
+    const hrFetch = async (a, b, prio) => {
+      if (hrMode === "rollup") {
+        try {
+          const pts = await rollup5Chunk(HR60, a, b, tz, prio);
+          for (const d of datesOf(a, b)) rolledFetched.add(d);
+          return [["hr60", pts]];
+        } catch (e) {
+          if (!["bad_request", "not_found"].includes(e.code)) throw e;
+          hrMode = "list"; // the 60 s rollUp was rejected: raw samples from here on (kept for later syncs)
+        }
+      }
+      const pts = [];
+      for (const [x, y] of chunks(a, b, HR_LIST.chunkDays)) pts.push(...(await listChunk(HR_LIST, x, y, tz, undefined, prio)));
+      return [["heart-rate", pts]];
+    };
+    for (const s of segs) {
+      const run = s.run;
+      // a night starts the evening before: fetch from the previous day so this segment's first night (sleep window,
+      // overnight HR/HRV/SpO2) is complete on its own, even if the older segment's requests never finish
+      const p0 = addDays(s.a, -1) < run.fs ? run.fs : addDays(s.a, -1);
+      // same chunk count as without the extra day: only the oldest chunk is one day wider
+      const segChunks = (a, b, n) => chunks(a, b, n).map((c, i) => (i === 0 && a === s.a ? [p0, c[1]] : c));
+      for (const id of ["exercise", "sleep"]) {
+        const t = typeOf(id);
+        s.deps.push(addJob({ kind: "list", t, run, a: p0, b: s.b, fetch: listFetch(t), split: true }, s).settled);
+      }
+      for (const [a, b] of chunks(s.a, s.b, HR60.chunkDays)) s.deps.push(addJob({ kind: "hr", t: HR60, run, a, b, fetch: hrFetch, split: true }, s).settled);
+      // full-resolution heart rate around this segment's workouts (in-workout series and 0–180 s recovery)
+      addJob({ kind: "hrw", t: { id: "heart-rate", key: "hrWorkout", optional: true }, run, a: s.a, b: s.b, split: false, waitFor: Promise.all(s.deps), fetch: async () => {
+        await Promise.all(s.deps);
+        if (fatal) throw fatal;
+        const lo = midnightMs(s.a, tz), hi = midnightMs(s.b, tz);
+        const wins = [];
+        for (const dp of raw.exercise || []) {
+          const p = payload(dp, "exercise");
+          const a = tms(p && p.interval && p.interval.startTime), b = tms(p && p.interval && p.interval.endTime);
+          if (!isNum(a) || !isNum(b) || b <= a || b - a > 86400000 || a < lo || a >= hi) continue;
+          const d = localInfo(a, tz).date;
+          if (!want.has(d) || !rolledFetched.has(d)) continue; // listed days already have every sample
+          wins.push([a - 5000, b + 185000]);
+        }
+        wins.sort((u, v) => u[0] - v[0]);
+        const merged = [];
+        for (const w of wins) {
+          const last = merged[merged.length - 1];
+          if (last && w[0] <= last[1]) last[1] = Math.max(last[1], w[1]);
+          else merged.push(w.slice());
+        }
+        // up to 3 windows at once (the shared rate limiter still paces them); results kept in window order
+        const got = new Array(merged.length);
+        let wi = 0;
+        await Promise.all(Array.from({ length: Math.min(3, merged.length) }, async () => {
+          while (wi < merged.length) {
+            const k = wi++;
+            if (fatal) return;
+            try {
+              got[k] = await listChunk(HR_LIST, null, null, tz, merged[k], segs.indexOf(s));
+            } catch (e) {
+              if (FATAL.includes(e.code)) throw e;
+              warnings.push(`Heart rate (workouts): ${e.message} Workout heart rate uses 1-minute values.`);
+            }
+          }
+        }));
+        if (fatal) throw fatal;
+        const pts = [];
+        for (const g of got) if (g) pts.push(...g);
+        return [["hrWorkout", pts]];
+      } }, s);
+      for (const id of DETAIL_IDS) {
+        const t = typeOf(id);
+        let a = s.a;
+        if (incremental && a < detailCutoff && !datesOf(s.a, s.b).some((d) => fullDates.has(d))) a = detailCutoff;
+        if (a >= s.b) continue;
+        for (const [x, y] of segChunks(a, s.b, Math.max(t.chunkDays, SEG_DAYS)).map((c) => (c[0] === a && a !== s.a ? [addDays(a, -1), c[1]] : c))) addJob({ kind: "list", t, run, a: x, b: y, fetch: listFetch(t), split: true }, s);
+      }
+      const sa5 = s.a < run.s ? run.s : s.a;
+      for (const [a, b] of chunks(sa5, s.b, STEPS5.chunkDays)) {
+        addJob({ kind: "rollup5", t: STEPS5, run, a, b, split: true, fetch: async (x, y, prio) => {
+          if (!stepsListMode) {
+            try {
+              return [["steps5", await rollup5Chunk(STEPS5, x, y, tz, prio)]];
+            } catch (e) {
+              if (!["bad_request", "not_found"].includes(e.code)) throw e;
+              stepsListMode = true; // rollUp rejected: use raw interval points from here on
+            }
+          }
+          const pts = [];
+          for (const [u, v] of chunks(x, y, STEPS_LIST.chunkDays)) pts.push(...(await listChunk(STEPS_LIST, u, v, tz, undefined, prio)));
+          return [["steps", pts]];
+        } }, s);
+      }
+    }
+
+    /* ---- 4. run ---- */
+    const status = new Map(); // source key → {type, points, status, message}
+    const statusOf = (sk) => {
+      if (!status.has(sk)) status.set(sk, { type: sk, points: 0, status: "ok" });
+      return status.get(sk);
+    };
+    const failedDays = new Set();
+    const coverage = {};
+    const dead = new Set();
+    const emitted = [];
+    const mapWarnings = [];
+    const saves = [];
+    let fatal = null;
+    let serverFails = 0;
+    let done = 0, daysDone = 0;
+    const report = (lbl) => {
       if (typeof opts.onProgress === "function") {
         try {
-          opts.onProgress({ done, total: plan.length, fraction: done / plan.length, label });
+          opts.onProgress({ done, total: jobs.length, fraction: jobs.length ? done / jobs.length : 1, label: lbl, daysDone, daysTotal: want.size });
         } catch (e) {}
       }
     };
-    report("Starting");
-    let fatal = null;
-    let stepsListMode = false; // set when the 5-minute rollUp is rejected; later chunks then use list
-    for (const job of plan) {
-      tasks.push(async () => {
-        if (fatal || failed.has(job.t.key || job.t.id)) {
-          done++;
-          return;
+    // Collect fetched points once each: overlapping windows (retried or split chunks, padded workout windows)
+    // can return the same reading twice, and a duplicate would skew medians such as nightly HRV.
+    const seen = new Map(); // key → Set of point fingerprints
+    const store = (key, pts, st) => {
+      const set = seen.get(key) || new Set();
+      seen.set(key, set);
+      const fresh = [];
+      for (const p of pts) {
+        const fp = JSON.stringify(p);
+        if (set.has(fp)) continue;
+        set.add(fp);
+        fresh.push(p);
+      }
+      if (key.startsWith("rollups:")) {
+        const id = key.slice(8);
+        (raw.rollups[id] || (raw.rollups[id] = [])).push(...fresh);
+      } else (raw[key] || (raw[key] = [])).push(...fresh);
+      st.points += fresh.length;
+    };
+    const mapSeg = (s) => {
+      const lo = midnightMs(s.a, tz) - 2 * 86400000, hi = midnightMs(s.b, tz) + 2 * 86400000;
+      const ylo = addDays(s.a, -2), yhi = addDays(s.b, 2);
+      const sub = { rollups: {} };
+      for (const [k, v] of Object.entries(raw)) {
+        if (k === "rollups") {
+          for (const [id, arr] of Object.entries(v)) sub.rollups[id] = arr.filter((rp) => {
+            const d = rp && rp.civilStartTime && ymdOfDate(rp.civilStartTime.date);
+            return !d || (d >= ylo && d <= yhi);
+          });
+        } else if (k === "hr60" || k === "steps5") {
+          sub[k] = v.filter((rp) => {
+            const t = tms(rp && rp.startTime);
+            return !isNum(t) || (t >= lo && t < hi);
+          });
+        } else if (Array.isArray(v)) {
+          const id = k === "hrWorkout" ? "heart-rate" : k;
+          sub[k] = v.filter((dp) => {
+            const t = pointMs(dp, id);
+            return !isNum(t) || (t >= lo && t < hi);
+          });
         }
-        const id = job.t.id;
-        const sk = job.t.key || id;
-        const st = status.get(sk) || { type: sk, points: 0, status: "ok" };
-        status.set(sk, st);
+      }
+      const m = mapResponses(sub, tz, { start: s.dates[0], end: s.dates[s.dates.length - 1] });
+      mapWarnings.push(...m.warnings);
+      const out = m.days.filter((d) => want.has(d.date));
+      const byDate = new Map(out.map((d) => [d.date, d]));
+      for (const date of s.dates) {
+        const d = byDate.get(date) || {};
+        coverage[date] = {
+          hrMinutes: Array.isArray(d.hr1) ? d.hr1.length : 0,
+          sleep: !!d.sleep,
+          workouts: Array.isArray(d.workouts) ? d.workouts.length : 0,
+          steps: isNum(d.steps) || (Array.isArray(d.steps5) && d.steps5.length > 0),
+        };
+      }
+      return out;
+    };
+    const emit = (s) => {
+      if (s.emitted || !s.dates.length) {
+        s.emitted = true;
+        return;
+      }
+      s.emitted = true;
+      const out = mapSeg(s);
+      emitted.push(...out);
+      daysDone += s.dates.length;
+      if (out.length && typeof opts.onDays === "function") {
         try {
-          if (job.kind === "rollup5") {
-            let pts = null;
-            if (!stepsListMode) {
-              try {
-                pts = await rollup5Chunk(job.t, job.a, job.b, tz);
-                (raw.steps5 || (raw.steps5 = [])).push(...pts);
-              } catch (e) {
-                if (!["bad_request", "not_found"].includes(e.code)) throw e;
-                stepsListMode = true; // rollUp rejected: use raw interval points from here on
-              }
-            }
-            if (pts === null) {
-              pts = [];
-              for (const [a, b] of chunks(job.a, job.b, STEPS_LIST.chunkDays)) pts.push(...(await listChunk(STEPS_LIST, a, b, tz)));
-              (raw.steps || (raw.steps = [])).push(...pts);
-            }
-            st.points += pts.length;
-          } else {
-            const pts = job.kind === "list" ? await listChunk(job.t, job.a, job.b, tz) : await rollupChunk(id, job.a, job.b);
-            if (job.kind === "list") (raw[id] || (raw[id] = [])).push(...pts);
-            else (raw.rollups[id] || (raw.rollups[id] = [])).push(...pts);
-            st.points += pts.length;
+          const p = opts.onDays(out);
+          if (p && typeof p.then === "function") saves.push(p.then(() => {}, () => {}));
+        } catch (e) {}
+      }
+    };
+    const settle = (job, aborted) => {
+      for (const s of job.segs) {
+        s.pending--;
+        if (aborted) s.aborted = true;
+        else if (!job.t.optional) s.reqDone++;
+        if (s.pending === 0 && !s.aborted && !fatal) s.done = true;
+      }
+      // emit finished segments newest first: an older one that finishes early waits for the newer ones
+      if (!fatal) for (const x of segs) {
+        if (!x.done) break;
+        emit(x);
+      }
+      done++;
+      job.resolve();
+      report(label(job.sk));
+    };
+    const recordFail = (job, a, b, e) => {
+      const st = statusOf(job.sk);
+      st.status = "error";
+      st.message = e.message;
+      if (TYPE_WIDE.includes(e.code)) {
+        dead.add(job.sk);
+        if (!job.t.optional) warnings.push(`${label(job.t.id)}: ${e.message}`);
+      } else if (!job.t.optional) {
+        for (const d of datesOf(a, b)) if (want.has(d)) failedDays.add(d);
+        warnings.push(`${label(job.sk)}: could not fetch ${a} to ${addDays(b, -1)} (${e.message})`);
+      }
+      if (job.kind === "rollup5") warnings.push(`${label(job.sk)}: not available (${e.message}). Daytime stress needs 5-minute steps.`);
+      if (e.code === "server" && ++serverFails >= 4 && !fatal) fatal = GHError("network", "Google Health had a server problem. Try again in a few minutes.", e.detail);
+    };
+    const runJob = async (job) => {
+      if (fatal) return settle(job, true);
+      if (dead.has(job.sk)) return settle(job, false);
+      const st = statusOf(job.sk);
+      // → null on success, else the last error (fatal errors throw)
+      const attempt = async (a, b) => {
+        let err = null;
+        for (let k = 0; k < 2; k++) {
+          if (k > 0) {
+            if (fatal) return err;
+            await sleepMs(CHUNK_RETRY_MS);
           }
-        } catch (e) {
-          if (["auth", "cors", "not_enabled", "network", "rate_limited"].includes(e.code)) {
-            fatal = fatal || e;
-          } else {
-            failed.add(job.kind === "rollup5" ? sk : id);
-            st.status = "error";
-            st.message = e.message;
-            if (!job.t.optional) warnings.push(`${label(id)}: ${e.message}`);
-            else if (job.kind === "rollup5") warnings.push(`${label(sk)}: not available (${e.message}). Daytime stress needs 5-minute steps.`);
+          try {
+            const res = await job.fetch(a, b, job.prio);
+            for (const [key, pts] of res) store(key, pts, st);
+            serverFails = 0;
+            return null;
+          } catch (e) {
+            if (FATAL.includes(e && e.code)) throw e;
+            err = e && e.message ? e : GHError("error", String(e));
+            if (TYPE_WIDE.includes(err.code)) return err;
           }
         }
-        done++;
-        report(label(id));
-      });
-    }
-    await pool(tasks, 2);
-    if (fatal) throw fatal;
+        return err;
+      };
+      try {
+        const e = await attempt(job.a, job.b);
+        if (e && fatal) return settle(job, true);
+        const n = datesOf(job.a, job.b).length;
+        if (e && job.split && n > 1 && !TYPE_WIDE.includes(e.code)) {
+          // split a failing multi-day chunk in halves once; keep whichever half works
+          const mid = addDays(job.a, Math.floor(n / 2));
+          for (const [a, b] of [[job.a, mid], [mid, job.b]]) {
+            if (fatal) return settle(job, true);
+            const e2 = await attempt(a, b);
+            if (e2 && fatal) return settle(job, true);
+            if (e2) recordFail(job, a, b, e2);
+          }
+        } else if (e) recordFail(job, job.a, job.b, e);
+      } catch (e) {
+        fatal = fatal || e;
+        return settle(job, true);
+      }
+      settle(job, false);
+    };
+    // Scheduler: always start the ready job of the newest unfinished segment first (ties: creation order), so the
+    // newest days finish and are saved early. A job with waitFor (workout heart rate) only becomes ready once its
+    // segment's sleep/workout/heart-rate lists are in, and doesn't hold a worker while it waits.
+    jobs.forEach((j, i) => {
+      j.ord = i;
+      j.prio = j.segs.length ? Math.min(...j.segs.map((x) => segs.indexOf(x))) : -1;
+    });
+    const schedule = async (n) => {
+      const queue = jobs.map((j) => ({ j, ready: !j.waitFor }));
+      let wake = null, signal = new Promise((r) => (wake = r));
+      const poke = () => {
+        const w = wake;
+        signal = new Promise((r) => (wake = r));
+        w();
+      };
+      for (const q of queue) if (!q.ready) q.j.waitFor.then(() => { q.ready = true; poke(); }, () => { q.ready = true; poke(); });
+      const take = () => {
+        let best = -1;
+        for (let k = 0; k < queue.length; k++) {
+          const q = queue[k];
+          if (q.ready && (best < 0 || q.j.prio < queue[best].j.prio || (q.j.prio === queue[best].j.prio && q.j.ord < queue[best].j.ord))) best = k;
+        }
+        return best < 0 ? null : queue.splice(best, 1)[0].j;
+      };
+      const worker = async () => {
+        while (queue.length) {
+          const j = take();
+          if (!j) {
+            await signal;
+            continue;
+          }
+          await runJob(j);
+          poke();
+        }
+      };
+      await Promise.all(Array.from({ length: Math.max(1, Math.min(n, jobs.length)) }, worker));
+    };
+    report("Starting");
+    await schedule(CONCURRENCY);
+    if (saves.length) await Promise.all(saves);
 
-    const mapped = mapResponses(raw, tz, { start, end: today });
     for (const st of status.values()) sources.push(st);
-    return { days: mapped.days, sources, warnings: warnings.concat(mapped.warnings), range: { start, end: today, tz } };
+    const sortDays = (arr) => arr.sort((a, b) => (a.date < b.date ? -1 : 1));
+    const fd = [...failedDays].sort();
+    const allWarnings = () => [...new Set(warnings.concat(mapWarnings))];
+    if (fatal) {
+      // keep everything fetched so far, but only dates whose jobs ALL finished (optional ones too): a day kept
+      // without its 5-minute steps or HRV detail would look complete later and never be fetched again
+      const extra = [];
+      for (const s of segs) if (!s.emitted && s.dates.length && s.pending === 0 && !s.aborted) extra.push(...mapSeg(s));
+      fatal.partial = { days: sortDays(emitted.concat(extra)), failedDays: fd, sources, warnings: allWarnings(), coverage };
+      throw fatal;
+    }
+    return { days: sortDays(emitted), sources, warnings: allWarnings(), range: { start: wantList[0], end: wantList[wantList.length - 1], tz }, failedDays: fd, coverage };
   }
 
   const LABELS = {
@@ -18414,6 +19336,7 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
     "daily-heart-rate-variability": "HRV", "heart-rate-variability": "HRV (detail)", "daily-oxygen-saturation": "Blood oxygen",
     "oxygen-saturation": "Blood oxygen (detail)", "daily-respiratory-rate": "Breathing rate", "respiratory-rate-sleep-summary": "Breathing rate (detail)",
     "daily-sleep-temperature-derivations": "Skin temperature", weight: "Weight", "body-fat": "Body fat", steps5: "Steps (5-min)",
+    hrWorkout: "Heart rate (workouts)",
   };
   const label = (id) => LABELS[id] || id;
 
@@ -18424,7 +19347,7 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
     configure, connect, isConnected, disconnect, sync, mapResponses, toImport,
     silentRefresh, tokenStatus, helperStatus, helperToken, consumeHelperRedirect, helperClaimPair,
     scopes: SCOPES.slice(), identityScopes: ID_SCOPES.slice(), LIST_TYPES, ROLLUP_TYPES,
-    _internal: { filterFor, midnightMs, localInfo, localIso, chunks, request, state, restoreToken, clearToken, TOKEN_KEY, ACCOUNT_KEY, HELPER_KEY, HELPER_PAIR_KEY },
+    _internal: { filterFor, midnightMs, localInfo, localIso, chunks, request, state, bucket, getHrMode: () => hrMode, setHrMode: (m) => (hrMode = m === "list" ? "list" : "rollup"), restoreToken, clearToken, TOKEN_KEY, ACCOUNT_KEY, HELPER_KEY, HELPER_PAIR_KEY },
   };
   restoreToken(); // a refresh within the token's lifetime needs no sign-in
   consumeHelperRedirect(); // back from the helper's Google sign-in: keep the device id, clean the URL
