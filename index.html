@@ -12148,7 +12148,6 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
     set(k) {
       k = String(k || "").trim();
       if (!k) lsSet(GMODEL_LS, "");
-      if (k !== lsGet(GKEY_LS)) gModels = null;
       return lsSet(GKEY_LS, k);
     },
   };
@@ -12190,10 +12189,13 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
       : "http_" + st;
     return apiErr(code, msg);
   }
-  let gModels = null; // ranked model names for this page view
+  let gModels = null, gModelsKey = ""; // ranked model names for this page view, and the key they were read with
   async function geminiModels(key, fresh) {
-    if (gModels && !fresh) return gModels;
+    if (gModels && !fresh && gModelsKey === key) return gModels;
     const saved = lsGet(GMODEL_LS);
+    // a model already worked on this browser: start with it straight away (no list request); the list is read
+    // only if that model stops working
+    if (!fresh && saved) return [saved].concat(GEMINI_FALLBACK.filter((x) => x !== saved));
     let ranked = null;
     try {
       const res = await fetch(`${GEMINI_HOST}/models?pageSize=200`, { headers: { "x-goog-api-key": key } });
@@ -12211,6 +12213,7 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
     // the model that worked last time goes first
     if (saved && ranked.includes(saved)) ranked = [saved].concat(ranked.filter((x) => x !== saved));
     gModels = ranked;
+    gModelsKey = key;
     return ranked;
   }
   /* turn Cadence messages ({role:user|assistant, content}) into Gemini contents */
@@ -12225,10 +12228,23 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
     }
     return out;
   }
+  // Gemini Flash models think before answering (medium by default); "low" answers these summaries much faster.
+  // Models that reject the setting are remembered and asked again without it.
+  const noThink = new Set();
   async function geminiOnce(key, model, body, onText) {
+    const send = (b) => fetch(`${GEMINI_HOST}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, { method: "POST", headers: gHeaders(key), body: JSON.stringify(b) });
+    const fast = noThink.has(model) ? body : { ...body, generationConfig: { ...(body.generationConfig || {}), thinkingConfig: { thinkingLevel: "low" } } };
     let res;
     try {
-      res = await fetch(`${GEMINI_HOST}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, { method: "POST", headers: gHeaders(key), body: JSON.stringify(body) });
+      res = await send(fast);
+      if (res.status === 400 && fast !== body) {
+        let t = "";
+        try { t = await res.clone().text(); } catch (e) {}
+        if (/think/i.test(t)) {
+          noThink.add(model);
+          res = await send(body);
+        }
+      }
     } catch (e) {
       throw apiErr("network", "Couldn't reach Google Gemini. Check your connection.");
     }
@@ -12291,7 +12307,7 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
     const body = { contents: geminiContents(messages), generationConfig: { temperature: typeof opts.temperature === "number" ? opts.temperature : 0.4 } };
     if (opts.system) body.systemInstruction = { parts: [{ text: String(opts.system) }] };
     let models = await geminiModels(key);
-    let last = null;
+    let last = null, relisted = false;
     for (let i = 0; i < models.length && i < 4; i++) {
       const model = models[i];
       try {
@@ -12302,7 +12318,16 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
         last = e;
         // a missing model, a used-up free quota (per model) or a busy model → try the next model, before any text arrived
         if ((e.code === "no_model" || e.code === "rate_limited" || e.code === "overloaded") && !e.text) {
-          if (e.code === "no_model" && lsGet(GMODEL_LS) === model) lsSet(GMODEL_LS, "");
+          if (e.code === "no_model" && lsGet(GMODEL_LS) === model) {
+            lsSet(GMODEL_LS, "");
+            if (!relisted) {
+              // the saved model is gone: read the current model list once and start over
+              relisted = true;
+              gModels = null;
+              models = await geminiModels(key, true);
+              i = -1;
+            }
+          }
           continue;
         }
         throw e;
@@ -14353,7 +14378,17 @@ html[data-hdr="title"] .pb-sum{margin-top:0}
     return html;
   }
 
+  // the summary only changes when the data does: reuse it between questions (the statistics take a moment on a phone)
+  let ctxMemo = { key: null, text: "" };
   function buildContext() {
+    const dv = App.derived();
+    const key = [dv.length, App.mode ? App.mode() : "", JSON.stringify(App.profile())].join("|");
+    if (ctxMemo.dv === dv && ctxMemo.key === key) return ctxMemo.text;
+    const text = buildContextRaw();
+    ctxMemo = { dv, key, text };
+    return text;
+  }
+  function buildContextRaw() {
     const days = App.days();
     const derived = App.derived();
     const p = fullProfile(App.profile());
