@@ -11558,10 +11558,10 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
   /* the AI coach is optional (CONTRACT-v3): listed only with an API key on the website,
      or inside Claude when the sample capability answers */
   function coachOn() {
-    if (env() === "web") return !!apiKey.get();
+    if (env() === "web") return !!(geminiKey.get() || apiKey.get());
     return S.sampleOk === true;
   }
-  const inNav = (k) => isView(k) && (k !== "coach" || coachOn() || S.view === "coach");
+  const inNav = (k) => isView(k) && (k !== "coach" || env() === "web" || coachOn() || S.view === "coach");
   const viewKeys = () => ORDER.filter(inNav).concat(Object.keys(Views).filter((k) => !ORDER.includes(k) && inNav(k)));
   const defaultView = () => (isView(DEFAULT_VIEW) ? DEFAULT_VIEW : viewKeys()[0] || DEFAULT_VIEW);
   const iconOf = (k) => extIcon(k) || extIcon(Views[k] && Views[k].icon) || localIcon(ICON[Views[k] && Views[k].icon] ? Views[k].icon : k);
@@ -12126,6 +12126,209 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
     },
   };
   const apiErr = (code, message, text) => Object.assign(new Error(message), { code, text });
+
+  /* ---------------- Gemini (Google AI Studio key, free tier available) ----------------
+     Same call shape: fn(messages, {onText, system, temperature}) → {text, model}. The key and the chosen model are kept
+     in this browser only. Requests go straight from the browser to generativelanguage.googleapis.com. */
+  const GKEY_LS = "cadence.geminiKey", GMODEL_LS = "cadence.geminiModel";
+  const GEMINI_HOST = "https://generativelanguage.googleapis.com/v1beta";
+  const lsGet = (k) => { try { return (lsOk && root.localStorage.getItem(k)) || ""; } catch (e) { return ""; } };
+  const lsSet = (k, v) => {
+    try {
+      if (!lsOk) return false;
+      if (v) root.localStorage.setItem(k, v);
+      else root.localStorage.removeItem(k);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  };
+  const geminiKey = {
+    get: () => lsGet(GKEY_LS),
+    set(k) {
+      k = String(k || "").trim();
+      if (!k) lsSet(GMODEL_LS, "");
+      if (k !== lsGet(GKEY_LS)) gModels = null;
+      return lsSet(GKEY_LS, k);
+    },
+  };
+  // used when the model list can't be read; newest stable first, Flash-Lite last (it has the most free requests)
+  const GEMINI_FALLBACK = ["gemini-flash-latest", "gemini-3.8-flash", "gemini-3.6-flash", "gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite"];
+  /* rank text models from GET /models: stable Flash (newest version first), then the -latest alias, then Flash-Lite */
+  function rankGeminiModels(list) {
+    const out = [];
+    for (const m of list || []) {
+      const name = String((m && m.name) || "").replace(/^models\//, "");
+      const methods = (m && m.supportedGenerationMethods) || [];
+      if (methods.length && !methods.includes("generateContent")) continue;
+      const g = /^gemini-(\d+(?:\.\d+)?)-flash(-lite)?$/.exec(name);
+      if (g) out.push({ name, v: parseFloat(g[1]), lite: !!g[2] });
+    }
+    out.sort((a, b) => (a.lite !== b.lite ? (a.lite ? 1 : -1) : b.v - a.v));
+    const flash = out.filter((x) => !x.lite).map((x) => x.name);
+    const lite = out.filter((x) => x.lite).map((x) => x.name);
+    const names = flash.slice(0, 2).concat(list && list.some((m) => /gemini-flash-latest$/.test(m && m.name)) ? ["gemini-flash-latest"] : [], lite.slice(0, 2));
+    return names.length ? [...new Set(names)] : GEMINI_FALLBACK.slice();
+  }
+  const gHeaders = (key) => ({ "content-type": "application/json", "x-goog-api-key": key });
+  async function geminiErr(res) {
+    let j = null;
+    try { j = await res.json(); } catch (e) {}
+    const er = (j && (Array.isArray(j) ? j[0] && j[0].error : j.error)) || {};
+    const reason = JSON.stringify(er.details || []);
+    const msg = er.message || "Request failed (" + res.status + ").";
+    const st = res.status;
+    const code =
+      /API_KEY_INVALID|API key not valid|API_KEY_/.test(reason + msg) ? "bad_key"
+      : st === 401 ? "bad_key"
+      : st === 403 ? (/SERVICE_DISABLED|has not been used|is disabled/i.test(msg + reason) ? "api_disabled" : /location|region|country/i.test(msg) ? "region" : "bad_key")
+      : st === 404 ? "no_model"
+      : st === 429 ? "rate_limited"
+      : st === 503 || st === 500 || st === 504 ? "overloaded"
+      : st === 400 && /location is not supported|User location/i.test(msg) ? "region"
+      : st === 400 && /model/i.test(msg) && /not found|not supported|unsupported/i.test(msg) ? "no_model"
+      : "http_" + st;
+    return apiErr(code, msg);
+  }
+  let gModels = null; // ranked model names for this page view
+  async function geminiModels(key, fresh) {
+    if (gModels && !fresh) return gModels;
+    const saved = lsGet(GMODEL_LS);
+    let ranked = null;
+    try {
+      const res = await fetch(`${GEMINI_HOST}/models?pageSize=200`, { headers: { "x-goog-api-key": key } });
+      if (res.ok) {
+        const j = await res.json();
+        ranked = rankGeminiModels((j && j.models) || []);
+      } else {
+        const e = await geminiErr(res);
+        if (e.code === "bad_key" || e.code === "api_disabled" || e.code === "region") throw e;
+      }
+    } catch (e) {
+      if (e && (e.code === "bad_key" || e.code === "api_disabled" || e.code === "region")) throw e;
+    }
+    if (!ranked) ranked = GEMINI_FALLBACK.slice();
+    // the model that worked last time goes first
+    if (saved && ranked.includes(saved)) ranked = [saved].concat(ranked.filter((x) => x !== saved));
+    gModels = ranked;
+    return ranked;
+  }
+  /* turn Cadence messages ({role:user|assistant, content}) into Gemini contents */
+  function geminiContents(messages) {
+    const out = [];
+    for (const m of messages || []) {
+      const role = m.role === "assistant" ? "model" : "user";
+      const text = String(m.content == null ? "" : m.content);
+      if (!text) continue;
+      if (out.length && out[out.length - 1].role === role) out[out.length - 1].parts[0].text += "\n\n" + text;
+      else out.push({ role, parts: [{ text }] });
+    }
+    return out;
+  }
+  async function geminiOnce(key, model, body, onText) {
+    let res;
+    try {
+      res = await fetch(`${GEMINI_HOST}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, { method: "POST", headers: gHeaders(key), body: JSON.stringify(body) });
+    } catch (e) {
+      throw apiErr("network", "Couldn't reach Google Gemini. Check your connection.");
+    }
+    if (!res.ok) throw await geminiErr(res);
+    let text = "", finish = "", blocked = "";
+    const handle = (block) => {
+      let data = "";
+      for (const line of block.split(/\r?\n/)) if (line.startsWith("data:")) data += line.slice(5).trim();
+      if (!data || data === "[DONE]") return;
+      let ev;
+      try { ev = JSON.parse(data); } catch (e) { return; }
+      if (ev.error) throw apiErr("stream", ev.error.message || "The answer stopped early.", text);
+      if (ev.promptFeedback && ev.promptFeedback.blockReason) blocked = ev.promptFeedback.blockReason;
+      const c = ev.candidates && ev.candidates[0];
+      if (!c) return;
+      if (c.finishReason) finish = c.finishReason;
+      const parts = (c.content && c.content.parts) || [];
+      let add = "";
+      for (const p of parts) if (p && typeof p.text === "string" && !p.thought) add += p.text;
+      if (add) {
+        text += add;
+        if (onText) try { onText({ text }); } catch (e) {}
+      }
+    };
+    const reader = res.body && res.body.getReader ? res.body.getReader() : null;
+    try {
+      if (!reader) {
+        handle(await res.text());
+      } else {
+        const dec = new TextDecoder();
+        let buf = "";
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          let k;
+          while ((k = buf.search(/\r?\n\r?\n/)) >= 0) {
+            const block = buf.slice(0, k);
+            buf = buf.slice(k).replace(/^\r?\n\r?\n/, "");
+            handle(block);
+          }
+        }
+        if (buf.trim()) handle(buf);
+      }
+    } catch (e) {
+      if (e && e.code) throw e;
+      throw apiErr("network", "The connection dropped.", text);
+    }
+    if (!text.trim()) {
+      if (blocked || /SAFETY|BLOCKLIST|PROHIBITED|SPII|RECITATION/.test(finish)) throw apiErr("blocked", "Gemini declined to answer this one. Try asking another way.");
+      throw apiErr("empty", "Gemini sent an empty answer. Try again.");
+    }
+    return { text, finish };
+  }
+  async function geminiSample(messages, opts) {
+    const key = geminiKey.get();
+    if (!key) throw apiErr("not_granted", "No Gemini key set.");
+    opts = opts || {};
+    const onText = typeof opts.onText === "function" ? opts.onText : null;
+    const body = { contents: geminiContents(messages), generationConfig: { temperature: typeof opts.temperature === "number" ? opts.temperature : 0.4 } };
+    if (opts.system) body.systemInstruction = { parts: [{ text: String(opts.system) }] };
+    let models = await geminiModels(key);
+    let last = null;
+    for (let i = 0; i < models.length && i < 4; i++) {
+      const model = models[i];
+      try {
+        const r = await geminiOnce(key, model, body, onText);
+        if (lsGet(GMODEL_LS) !== model) lsSet(GMODEL_LS, model);
+        return { text: r.text, model };
+      } catch (e) {
+        last = e;
+        // a missing model, a used-up free quota (per model) or a busy model → try the next model, before any text arrived
+        if ((e.code === "no_model" || e.code === "rate_limited" || e.code === "overloaded") && !e.text) {
+          if (e.code === "no_model" && lsGet(GMODEL_LS) === model) lsSet(GMODEL_LS, "");
+          continue;
+        }
+        throw e;
+      }
+    }
+    throw last || apiErr("no_model", "No Gemini model is available for this key.");
+  }
+  /* check a key before saving it: one tiny request → {ok, model} or throws with .code */
+  async function geminiCheck(key) {
+    key = String(key || "").trim();
+    gModels = null;
+    const models = await geminiModels(key, true);
+    let last = null;
+    for (let i = 0; i < models.length && i < 4; i++) {
+      try {
+        await geminiOnce(key, models[i], { contents: [{ role: "user", parts: [{ text: "Reply with the single word: ready" }] }], generationConfig: { temperature: 0 } }, null);
+        lsSet(GMODEL_LS, models[i]);
+        return { ok: true, model: models[i] };
+      } catch (e) {
+        last = e;
+        if (e.code === "no_model" || e.code === "rate_limited" || e.code === "overloaded") continue;
+        throw e;
+      }
+    }
+    throw last || apiErr("no_model", "No Gemini model is available for this key.");
+  }
   async function apiSample(messages, opts) {
     const key = apiKey.get();
     if (!key) throw apiErr("not_granted", "No API key set.");
@@ -12225,7 +12428,7 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
     strainTarget,
     sample: {
       use: async () => {
-        if (env() === "web") return apiKey.get() ? apiSample : null;
+        if (env() === "web") return geminiKey.get() ? geminiSample : apiKey.get() ? apiSample : null;
         try {
           return root.claude && root.claude.use ? (await root.claude.use("sample")) || null : null;
         } catch (e) {
@@ -12234,6 +12437,14 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
       },
     },
     apiKey,
+    geminiKey,
+    ai: {
+      provider: () => (env() === "web" ? (geminiKey.get() ? "gemini" : apiKey.get() ? "anthropic" : null) : S.sampleOk ? "claude" : null),
+      model: () => lsGet(GMODEL_LS) || null,
+      checkGemini: geminiCheck,
+      _rank: rankGeminiModels,
+      _contents: geminiContents,
+    },
     coachOn: () => coachOn(),
     ageOn,
     env,
@@ -12762,7 +12973,19 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
     return tiles ? U().section({ title: "Outlook", body: `<div class="tiles">${tiles}</div>` }) : "";
   }
 
+  const aiCard = (ctx) => {
+    try {
+      return window.CadenceAI && typeof window.CadenceAI.homeCard === "function" ? window.CadenceAI.homeCard(ctx) || "" : "";
+    } catch (e) {
+      return "";
+    }
+  };
   Views.overview = {
+    after() {
+      try {
+        if (window.CadenceAI && typeof window.CadenceAI.homeAfter === "function") window.CadenceAI.homeAfter();
+      } catch (e) {}
+    },
     label: "Home",
     icon: "home",
     dated: true,
@@ -12789,7 +13012,7 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
       const top = `<div class="ov-top"><section class="ov-dialbox" aria-label="Scores"><div class="ov-mark" aria-hidden="true">Cadence</div><div class="ov-dials">${dials}</div></section>` +
         `<div class="ui-mons">${healthTile(ctx)}${stressTile(ctx)}</div></div>`;
       const dash = C.section({ title: "My Dashboard", actionHtml: `<span class="ov-dash-sub">vs. 30-day average</span>`, body: dashboardRows(ctx) });
-      return `<div class="page one-col v-overview ov5">${top}${C.insightCard({ items, aria: "Today's insight" })}` +
+      return `<div class="page one-col v-overview ov5">${top}${C.insightCard({ items, aria: "Today's insight" })}${aiCard(ctx)}` +
         `<div class="ov-cols"><div class="ov-col">${myDay(ctx)}</div><div class="ov-col">${dash}${outlook(ctx)}</div></div></div>`;
     },
   };
@@ -14099,6 +14322,12 @@ html[data-hdr="title"] .pb-sum{margin-top:0}
     "What would lower my biological age?",
   ];
 
+  const QUICK = {
+    brief: { label: "Morning brief", prompt: "Give me my morning brief for the latest day: 1) one line on recovery and what is driving it, 2) how hard to train today with the suggested strain range, 3) one sleep action for tonight with a bedtime. Use 3 short bullets, under 90 words, numbers from the data." },
+    week: { label: "Weekly review", prompt: "Review my last 7 days against the week before: what improved, what got worse, the main reason, and 3 specific actions for next week. Under 200 words, cite numbers and dates." },
+    explain: { label: "Explain my recovery", prompt: "Explain today's recovery score: which inputs (HRV, resting heart rate, sleep, strain, respiratory rate) pushed it up or down compared with my normal, and what I can change." },
+  };
+
   function renderMd(text) {
     const lines = esc(text).replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>").split(/\r?\n/);
     let html = "", inList = false, para = [];
@@ -14170,11 +14399,53 @@ html[data-hdr="title"] .pb-sum{margin-top:0}
         ? `Biological age estimate: ${ba.age.toFixed(1)} (calendar ${ba.chronological})${isNum(ba.pace) ? `; pace of aging ${ba.pace.toFixed(2)}x (${paceLabelOf(ba)})` : ""}; components: ${(ba.parts || []).filter((x) => x && isNum(x.years)).map((x) => `${x.key} ${x.years >= 0 ? "+" : ""}${x.years.toFixed(1)} yr${x.detail ? ` (${x.detail})` : ""}`).join("; ")}.`
         : "Biological age: not enough data.",
       imp.length ? `Journal tags vs next-morning recovery: ${imp.map((x) => `${x.tag} ${x.diff >= 0 ? "+" : ""}${x.diff.toFixed(0)} pts (n=${x.n})`).join("; ")}.` : "",
+      analyticsContext(days, derived, last, p),
     ].filter(Boolean).join("\n");
   }
 
+  /* results of Cadence's own statistics (no AI involved), so the model explains computed numbers instead of guessing */
+  function analyticsContext(days, derived, last, p) {
+    const A = window.CadenceAnalytics || {};
+    const out = [];
+    const r1 = (v, dp) => (isNum(v) ? (dp ? v.toFixed(dp) : String(Math.round(v))) : "?");
+    const tryRun = (name, args) => {
+      try {
+        return typeof A[name] === "function" ? A[name].apply(null, args) : null;
+      } catch (e) {
+        return null;
+      }
+    };
+    const w = tryRun("warning", [days, derived, last]);
+    if (w && w.ready) out.push(`Early warning (robust z-scores vs personal baseline): level ${w.level}${(w.signals || []).length ? `, signals ${w.signals.map((x) => (x && (x.key || x.name)) || x).join(", ")}` : ""}${w.consecutiveDays ? `, ${w.consecutiveDays} day(s) in a row` : ""}. ${w.message || ""}`);
+    const wr = tryRun("weeklyReport", [days, derived, last]);
+    if (wr && wr.status === "ok") {
+      out.push(`This week (${wr.period.start} to ${wr.period.end}) vs last week: ${(wr.metrics || []).map((m) => `${m.name} ${r1(m.thisWeek, m.unit === "h" ? 1 : 0)}${m.unit || ""} (${isNum(m.change) ? (m.change >= 0 ? "+" : "") + r1(m.change, m.unit === "h" ? 1 : 0) : "?"}${m.good === true ? ", better" : m.good === false ? ", worse" : ""})`).join("; ")}.`);
+      if (wr.bestDay) out.push(`Best day this week: ${wr.bestDay.date} — ${wr.bestDay.note || ""}`);
+      if (wr.toughestDay) out.push(`Toughest day this week: ${wr.toughestDay.date} — ${wr.toughestDay.note || ""}`);
+      if (wr.load) out.push(`Training load (Banister model): fitness CTL ${r1(wr.load.ctl, 1)}, fatigue ATL ${r1(wr.load.atl, 1)}, form TSB ${r1(wr.load.tsb, 1)}, acute:chronic ratio ${r1(wr.load.acwr, 2)} (${wr.load.status}), week strain total ${r1(wr.load.totalStrain, 1)}.`);
+      if (Array.isArray(wr.plan) && wr.plan.length) out.push(`Suggested next 7 days (rule-based): ${wr.plan.map((x) => `${x.weekday} ${x.type} ${r1(x.lo, 1)}–${r1(x.hi, 1)}`).join("; ")}.`);
+      if (Array.isArray(wr.actions) && wr.actions.length) out.push(`Rule-based actions: ${wr.actions.map((x) => (typeof x === "string" ? x : x && (x.text || x.title)) || "").filter(Boolean).join(" | ")}`);
+    }
+    const dr = tryRun("drivers", [days, derived]);
+    const drs = Array.isArray(dr) ? dr : dr && Array.isArray(dr.items) ? dr.items : [];
+    const sig = drs.filter((x) => x && isNum(x.effect) && (x.label === "likely" || x.label === "clear" || (isNum(x.q) && x.q < 0.1))).slice(0, 8);
+    if (sig.length) out.push(`Habit/driver effects that passed the false-discovery check (Welch t-test / Spearman with Benjamini–Hochberg): ${sig.map((x) => `${x.feature || x.name} → ${x.outcomeLabel || x.outcome} ${x.effect >= 0 ? "+" : ""}${r1(x.effect, 1)} ${x.unit || ""} (${x.label || "q=" + r1(x.q, 2)}, n=${x.n || "?"})`).join("; ")}.`);
+    else if (drs.length) out.push("Habit drivers: none passed the false-discovery check yet (not enough evidence).");
+    const fc = tryRun("forecast", [days, derived, last, {}]);
+    if (fc && fc.status === "ok") out.push(`Tomorrow's recovery forecast (ridge regression on own history, ${fc.intervalPct}% interval): ${r1(fc.recovery)}% (${r1(fc.lo)}–${r1(fc.hi)}), assuming bedtime ${fc.bedtime} and ${r1(fc.timeInBedH, 1)} h in bed; biggest factors ${(fc.drivers || []).slice(0, 3).map((x) => `${x.name} ${x.effect >= 0 ? "+" : ""}${r1(x.effect, 1)}`).join(", ")}. Cross-validated R² ${r1(fc.r2cv, 2)}.`);
+    const sd = tryRun("sleepDebt", [days, derived, last]);
+    if (sd && sd.status === "ok") out.push(`Sleep debt over the last ${sd.nights} nights: ${r1(sd.hours, 1)} h (${sd.level}).`);
+    const sw = tryRun("sleepWindow", [days, derived]);
+    if (sw && sw.status === "ok") out.push(`Bedtime analysis: usual bedtime ${sw.usualBedtime}${sw.best ? `; best recovery when asleep ${sw.best.from}–${sw.best.to} (mean ${r1(sw.best.recovery && sw.best.recovery.mean)}%, n=${sw.best.n})` : ""}${sw.bestDuration ? `; best sleep length ${sw.bestDuration.label || sw.bestDuration.fromH + "–" + sw.bestDuration.toH + " h"} (mean recovery ${r1(sw.bestDuration.recovery && sw.bestDuration.recovery.mean)}%)` : ""}.`);
+    const ch = tryRun("chronotype", [days, derived]);
+    if (ch && (ch.label || ch.type)) out.push(`Chronotype: ${ch.label || ch.type}${ch.msfsc ? ` (MSFsc ${ch.msfsc})` : ""}.`);
+    const cd = tryRun("cardio", [days, derived, p]);
+    if (cd && cd.latest && isNum(cd.latest.vo2)) out.push(`Estimated VO2max ${r1(cd.latest.vo2, 1)} ml/kg/min${cd.latest.norm ? ` (${cd.latest.norm.category}, ${cd.latest.norm.text} for age/sex)` : ""}${isNum(cd.latest.change28) ? `, ${cd.latest.change28 >= 0 ? "+" : ""}${r1(cd.latest.change28, 1)} over 28 days` : ""}${cd.hrr && isNum(cd.hrr.median60) ? `; heart-rate recovery after workouts ${r1(cd.hrr.median60)} bpm in 60 s` : ""}.`);
+    return out.length ? "\nCadence analytics (computed, trustworthy):\n" + out.join("\n") : "";
+  }
+
   const INSTRUCTIONS = `You are the Cadence coach inside a personal training and recovery dashboard. Answer the user's question about their own data below.
-Rules: be concise (under ~180 words unless they ask for a plan). Be specific: cite actual numbers and dates. Tie advice to strain, recovery band and sleep need (e.g. how hard to go today, when to go to bed). Use plain language, short sentences, and "- " bullets where useful; **bold** sparingly. Don't diagnose or name medical conditions; if something looks like a medical concern, suggest they talk to a doctor. Don't invent data; say when it's missing. Recovery, strain, sleep performance and biological age are Cadence estimates, not medical measures.`;
+Rules: be concise (under ~180 words unless they ask for a plan or review). Use only the numbers in <data>; Cadence computed them, so never recalculate or estimate scores yourself. When analytics say an effect is not proven, say so. Be specific: cite actual numbers and dates. Tie advice to strain, recovery band and sleep need (e.g. how hard to go today, when to go to bed). Use plain language, short sentences, and "- " bullets where useful; **bold** sparingly. Don't diagnose or name medical conditions; if something looks like a medical concern, suggest they talk to a doctor. Don't invent data; say when it's missing. Recovery, strain, sleep performance and biological age are Cadence estimates, not medical measures.`;
 
   function modelMessages() {
     const turns = [];
@@ -14198,10 +14469,10 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
     if (t && t.lastElementChild && t.lastElementChild.scrollIntoView) t.lastElementChild.scrollIntoView({ block: "end", behavior: "smooth" });
   }
 
-  async function ask(q) {
+  async function ask(q, shown) {
     q = String(q || "").trim().slice(0, 1000);
     if (!q || coach.streaming || coach.status !== "ready" || !coach.sample) return;
-    coach.log.push({ role: "user", content: q });
+    coach.log.push({ role: "user", content: q, shown: shown || "" });
     coach.streaming = true;
     coach.live = "";
     App.rerender();
@@ -14220,15 +14491,16 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
       coach.log.push({ role: "assistant", content: text || "I couldn't come up with an answer. Try asking another way." });
     } catch (e) {
       const code = e && e.code;
-      if (code === "bad_key") {
-        coach.log.push({ role: "assistant", error: true, content: "Anthropic didn't accept your API key. Check it below, or remove it and paste a new one." });
+      const msg = errText(e);
+      if (msg) {
+        coach.log.push({ role: "assistant", error: true, content: msg });
       } else if (code === "overloaded") {
-        coach.log.push({ role: "assistant", error: true, content: "Claude is busy right now. Try again in a minute." });
+        coach.log.push({ role: "assistant", error: true, content: "The AI is busy right now. Try again in a minute." });
       } else if (code === "not_granted") {
         coach.status = "blocked";
         coach.log.push({ role: "assistant", error: true, content: "The coach needs your permission to use Claude. It's switched off for this visit." });
       } else if (code === "rate_limited") {
-        coach.log.push({ role: "assistant", error: true, content: "Too many questions at once. Try again in a minute." });
+        coach.log.push({ role: "assistant", error: true, content: provider() === "gemini" ? "You've hit Gemini's free limit for now. Wait a minute (or until tomorrow if it's the daily limit) and try again." : "Too many questions at once. Try again in a minute." });
       } else {
         const partial = e && typeof e.text === "string" && e.text.trim();
         coach.log.push({ role: "assistant", error: !partial, content: partial ? e.text : "Something went wrong getting an answer. Try again." });
@@ -14240,6 +14512,21 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
       App.rerender();
       scrollThread();
     }
+  }
+
+  const provider = () => (App.ai && App.ai.provider ? App.ai.provider() : null);
+  const providerName = () => (provider() === "gemini" ? "Google Gemini" : provider() === "anthropic" ? "Anthropic" : "Claude");
+  /* key and setup problems in plain words; null for the generic ones handled by the caller */
+  function errText(e) {
+    const code = e && e.code;
+    const g = provider() === "gemini";
+    if (code === "bad_key") return g ? "Google didn't accept your Gemini key. Check it in the AI key card below, or remove it and paste a new one." : "Anthropic didn't accept your API key. Check it below, or remove it and paste a new one.";
+    if (code === "api_disabled") return "The Gemini API isn't switched on for the Google project behind this key. Create the key in Google AI Studio (aistudio.google.com), which switches it on for you.";
+    if (code === "region") return "Google doesn't offer the Gemini API in your current region.";
+    if (code === "no_model") return "None of the Gemini models are available for this key right now. Try again later.";
+    if (code === "blocked" || code === "empty") return (e && e.message) || "No answer came back. Try asking another way.";
+    if (code === "network") return `Couldn't reach ${providerName()}. Check your connection and try again.`;
+    return null;
   }
 
   function checkSample() {
@@ -14260,14 +14547,14 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
   }
 
   Views.coach = {
-    label: "Coach",
+    label: "AI Coach",
     icon: "coach",
     dated: false,
     render(ctx) {
       const hasData = ctx.days && ctx.days.length;
       const sub = "Training and recovery advice from your own numbers";
       const ctxDays = Math.min(30, (ctx.days || []).length);
-      const coachHero = hero({ eyebrow: "Ask your data", title: "Coach", sum: sub, num: ctxDays, label: "days it reads" });
+      const coachHero = hero({ eyebrow: "Ask your data", title: "AI Coach", sum: sub, num: ctxDays, label: "days it reads" });
       if (coach.status === "unknown" || coach.status === "checking") {
         return `<div class="page">${coachHero}<div class="card"><p class="muted">Connecting to the coach…</p></div></div>`;
       }
@@ -14281,16 +14568,19 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
       const thread = coach.log
         .map((t) =>
           t.role === "user"
-            ? `<div class="co-msg co-user">${esc(t.content)}</div>`
+            ? `<div class="co-msg co-user">${esc(t.shown || t.content)}</div>`
             : `<div class="co-msg co-bot${t.error ? " co-err" : ""}">${t.error ? esc(t.content) : renderMd(t.content)}</div>`,
         )
         .join("");
       const live = coach.streaming ? `<div class="co-msg co-bot" id="coach-live" aria-live="polite">${coach.live ? renderMd(coach.live) : '<span class="muted">Thinking…</span>'}</div>` : "";
       const intro = !coach.log.length
-        ? `<div class="insight">Ask how hard to push today, why your recovery moved, or how to hit your sleep need. The coach reads your last 30 days and 90-day averages${App.mode && App.mode() === "sample" ? " (sample data right now)" : ""}. It's not a doctor.</div>`
+        ? `<div class="insight">Ask how hard to push today, why your recovery moved, or how to hit your sleep need. The coach reads a summary of your last 30 days, 90-day averages and Cadence's own statistics${App.mode && App.mode() === "sample" ? " (sample data right now)" : ""}. Cadence does the maths; the AI explains it. It's not a doctor.</div>`
+        : "";
+      const quick = !coach.streaming && coach.status === "ready" && hasData
+        ? `<div class="co-quick">${Object.entries(QUICK).map(([k, x]) => `<button type="button" class="btn small${k === "brief" ? " primary" : ""}" data-action="coach-quick" data-k="${k}">${esc(x.label)}</button>`).join("")}</div>`
         : "";
       const chips = !coach.streaming && coach.status === "ready" && hasData
-        ? `<div class="co-chips">${SUGGESTIONS.map((s) => `<button type="button" class="tag pill" data-action="coach-chip" data-q="${esc(s)}">${esc(s)}</button>`).join("")}</div>`
+        ? `${quick}<div class="co-chips">${SUGGESTIONS.map((s) => `<button type="button" class="tag pill" data-action="coach-chip" data-q="${esc(s)}">${esc(s)}</button>`).join("")}</div>`
         : "";
       const composer =
         coach.status === "blocked"
@@ -14332,6 +14622,8 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
 .co-bot{align-self:flex-start;background:var(--surface-2);color:var(--ink);border-bottom-left-radius:4px;border-left:2px solid var(--strain)}
 .co-err{color:var(--red,var(--bad));border-left-color:var(--red,var(--bad))}
 .co-chips{display:flex;flex-wrap:wrap;gap:8px}
+.co-quick{display:flex;flex-wrap:wrap;gap:8px}
+.co-model{font-size:var(--fs-xs,12px)}
 .co-chips .tag{border-radius:999px}
 .co-form{display:flex;gap:8px;align-items:flex-end}
 .co-field{flex:1;margin:0}
@@ -14340,60 +14632,184 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
 .co-key{display:flex;flex-direction:column;gap:12px}
 .co-key > * + *{margin-top:0}
 .co-steps{margin:0;padding-left:1.3em;line-height:1.6}
-.co-key .co-form{flex-wrap:wrap}`,
+.co-key .co-form{flex-wrap:wrap}
+.ai-brief{display:flex;flex-direction:column;gap:8px;border-left:2px solid var(--strain)}
+.ai-brief .card-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.ai-b-actions{display:flex;gap:6px}
+.ai-b-text p{margin:0 0 .4em}.ai-b-text ul{margin:0;padding-left:1.2em;line-height:1.5}.ai-b-text li+li{margin-top:4px}
+.ai-b-err{margin:0;color:var(--warning)}`,
   };
 
-  /* website only: the coach runs on the user's own Anthropic API key, kept in this browser */
+  /* website only: the coach runs on the user's own key (Google Gemini, free tier available; or Anthropic), kept in this browser */
+  const keyState = { checking: false };
   function keyCard(hasKey) {
     if (hasKey) {
+      const g = provider() === "gemini";
+      const model = g && App.ai && App.ai.model ? App.ai.model() : null;
       return `<div class="card co-key">
-        <div class="card-head"><h2>Your Anthropic API key</h2><span class="chip good">In use</span></div>
-        <p class="muted">The coach sends your question and a summary of your last 90 days straight from this browser to Anthropic, using your key. The key is stored only in this browser.</p>
+        <div class="card-head"><h2>${g ? "Your Gemini key" : "Your Anthropic API key"}</h2><span class="chip good">In use</span></div>
+        <p class="muted">The coach sends your question and a summary of your health numbers (daily scores, not minute-by-minute readings) straight from this browser to ${g ? "Google" : "Anthropic"}, using your key. The key is stored only in this browser.${model ? ` <span class="co-model">Model: ${esc(model)}.</span>` : ""}</p>
+        ${g ? `<p class="note">On Gemini's free tier Google may use what you send to improve its products. Turn on billing for the key's project in AI Studio if you don't want that.</p>` : ""}
         <div class="btn-row"><button class="btn ghost small" type="button" data-action="coach-key-remove">Remove key</button></div>
       </div>`;
     }
     return `<div class="card co-key">
-      <div class="card-head"><h2>Turn on the coach</h2><span class="card-meta">Optional</span></div>
-      <p class="muted">On this website the coach needs your own Anthropic API key. Everything else in Cadence works without it.</p>
+      <div class="card-head"><h2>Turn on the AI coach</h2><span class="card-meta">Free with Gemini</span></div>
+      <p class="muted">The coach and the daily brief need an AI key. A Google Gemini key is free. Everything else in Cadence works without it.</p>
       <ol class="co-steps">
-        <li>Sign in at console.anthropic.com and add a little credit.</li>
-        <li>Open API Keys and create a key.</li>
+        <li>Open <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer">aistudio.google.com/app/apikey</a> and sign in with Google.</li>
+        <li>Tap <strong>Create API key</strong> and copy it.</li>
         <li>Paste it below.</li>
       </ol>
       <form data-submit="coach-key" class="co-form" autocomplete="off">
-        <label class="field co-field"><span>Anthropic API key</span><input name="key" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…" required></label>
-        <button class="btn primary" type="submit">Use my key</button>
+        <label class="field co-field"><span>Gemini key (or Anthropic key)</span><input name="key" type="password" autocomplete="off" spellcheck="false" placeholder="AIza…" required ${keyState.checking ? "disabled" : ""}></label>
+        <button class="btn primary" type="submit" ${keyState.checking ? "disabled" : ""}>${keyState.checking ? "Checking…" : "Use my key"}</button>
       </form>
-      <p class="note">Your key is stored only in this browser, never on a server we run. Anyone who can use this browser can use it, so don't save it on a shared computer. Each question is billed to your Anthropic account and sends a summary of your health numbers to Anthropic.</p>
+      <p class="note">The key is stored only in this browser, never on a server. Anyone who can use this browser can use it. Each question sends a summary of your daily health numbers to Google (or Anthropic). On Gemini's free tier Google may use that to improve its products.</p>
     </div>`;
   }
-  on("onSubmit", "coach-key", (form, fd) => {
-    const k = String(fd.get("key") || "").trim();
-    if (!k) return;
-    if (!/^sk-ant-/.test(k)) {
-      App.toast("That doesn't look like an Anthropic key. It starts with sk-ant-.");
-      return;
-    }
-    if (!App.apiKey.set(k)) {
-      App.toast("This browser won't let Cadence store the key.");
-      return;
-    }
+  const resetCoach = () => {
     coach.status = "unknown";
     coach.sample = null;
-    App.toast("Coach turned on");
+    brief.state = "idle";
+  };
+  on("onSubmit", "coach-key", async (form, fd) => {
+    const k = String(fd.get("key") || "").trim().replace(/\s+/g, "");
+    if (!k || keyState.checking) return;
+    if (/^sk-ant-/.test(k)) {
+      if (!App.apiKey.set(k)) return App.toast("This browser won't let Cadence store the key.");
+      App.geminiKey.set("");
+      resetCoach();
+      App.toast("Coach turned on");
+      return App.rerender();
+    }
+    if (!/^AIza[0-9A-Za-z_\-]{30,}$/.test(k)) {
+      App.toast("That doesn't look like a Gemini key. It starts with AIza.");
+      return;
+    }
+    keyState.checking = true;
     App.rerender();
+    try {
+      const r = await App.ai.checkGemini(k);
+      if (!App.geminiKey.set(k)) throw Object.assign(new Error("store"), { code: "store" });
+      resetCoach();
+      App.toast("AI coach turned on");
+    } catch (e) {
+      const code = e && e.code;
+      App.toast(
+        code === "store" ? "This browser won't let Cadence store the key."
+        : code === "bad_key" ? "Google didn't accept that key. Copy it again from AI Studio."
+        : code === "api_disabled" ? "The Gemini API is off for that key's project. Create the key in AI Studio."
+        : code === "region" ? "Gemini isn't offered in your region."
+        : code === "rate_limited" ? "The key works but its free limit is used up right now. Try again later."
+        : code === "network" ? "Couldn't reach Google. Check your connection."
+        : "Couldn't check the key: " + ((e && e.message) || "unknown error"),
+      );
+    } finally {
+      keyState.checking = false;
+      App.rerender();
+    }
   });
   on("on", "coach-key-remove", () => {
-    if (coach.streaming) return;
+    if (coach.streaming || brief.state === "loading") return;
     App.apiKey.set("");
-    coach.status = "unknown";
-    coach.sample = null;
+    App.geminiKey.set("");
+    resetCoach();
     App.toast("Key removed");
     App.rerender();
   });
 
+  /* ---------- daily AI brief on Home: once per day per data state, cached in this browser ---------- */
+  const BRIEF_LS = "cadence.aiBrief";
+  const brief = { state: "idle", text: "", err: "", sig: "" }; // idle | loading | done | error
+  const lsRead = () => { try { return JSON.parse(localStorage.getItem(BRIEF_LS) || "null"); } catch (e) { return null; } };
+  const lsWrite = (v) => { try { localStorage.setItem(BRIEF_LS, JSON.stringify(v)); } catch (e) {} };
+  function briefSig() {
+    const ds = App.days(), dv = App.derived();
+    if (!ds.length) return "";
+    const k = ds.length - 1, d = dv[k] || {};
+    const r = (v) => (isNum(v) ? Math.round(v) : "-");
+    return [ds[k].date, r(d.recovery), r(perfOf(d)), isNum(d.strain) ? d.strain.toFixed(0) : "-", App.mode ? App.mode() : ""].join("|");
+  }
+  const BRIEF_SYSTEM = "You are the Cadence coach. Write a morning brief from the user's data. Exactly 3 short bullets starting with '- ': recovery and its main driver; how hard to train today with the suggested strain range; one sleep action for tonight with a bedtime. Under 80 words. Use only numbers from the data; never invent or recalculate scores. No medical diagnosis.";
+  async function makeBrief(force) {
+    if (brief.state === "loading") return;
+    const sig = briefSig();
+    if (!sig) return;
+    const cached = lsRead();
+    if (!force && cached && cached.sig === sig && cached.text) {
+      Object.assign(brief, { state: "done", text: cached.text, err: "", sig });
+      if (App.view && App.view() === "overview") App.rerender();
+      return;
+    }
+    // automatic briefs: at most 3 a day (new data arriving), so the free quota isn't used up
+    const today = E.ymd(new Date());
+    const runs = cached && cached.day === today ? cached.runs || 0 : 0;
+    if (!force && runs >= 3) {
+      brief.sig = sig;
+      if (cached && cached.text) Object.assign(brief, { state: "done", text: cached.text, err: "" });
+      if (App.view && App.view() === "overview") App.rerender();
+      return;
+    }
+    brief.sig = sig;
+    let fn = null;
+    try { fn = await App.sample.use(); } catch (e) { fn = null; }
+    if (typeof fn !== "function") return;
+    Object.assign(brief, { state: "loading", err: "", sig });
+    if (App.view && App.view() === "overview") App.rerender();
+    try {
+      const res = await fn([{ role: "user", content: `${BRIEF_SYSTEM}\n\n<data>\n${buildContext()}\n</data>\n\nMorning brief for ${App.days()[App.days().length - 1].date}.` }], { temperature: 0.3, modelTier: "default", cache: false });
+      const text = String((res && res.text) || "").trim();
+      if (!text) throw Object.assign(new Error("empty"), { code: "empty" });
+      Object.assign(brief, { state: "done", text, err: "" });
+      lsWrite({ sig, text, at: Date.now(), day: today, runs: runs + 1 });
+    } catch (e) {
+      const m = errText(e);
+      Object.assign(brief, {
+        state: "error",
+        err: m || (e && e.code === "rate_limited" ? "Gemini's free limit is used up for now. Try again later." : "Couldn't write today's brief. Try again."),
+      });
+      if (cached && cached.text) brief.text = cached.text;
+      lsWrite(Object.assign({}, cached || {}, { day: today, runs: runs + 1 }));
+    } finally {
+      if (App.view && App.view() === "overview") App.rerender();
+    }
+  }
+  window.CadenceAI = {
+    homeCard(ctx) {
+      if (!provider() || !App.days().length) return "";
+      // only on the latest day: the brief is about today
+      const ds = App.days();
+      if (ctx && ctx.day && ctx.day.date !== ds[ds.length - 1].date) return "";
+      const body =
+        brief.state === "loading" && !brief.text ? `<p class="muted ai-b-wait">Writing today's brief…</p>`
+        : brief.text ? `<div class="ai-b-text">${renderMd(brief.text)}</div>`
+        : brief.state === "error" ? "" : `<p class="muted">Your AI brief for today appears here.</p>`;
+      const err = brief.state === "error" ? `<p class="note ai-b-err">${esc(brief.err)}</p>` : "";
+      return `<section class="card ai-brief" aria-label="AI brief">
+        <div class="card-head"><h2>AI brief</h2><div class="ai-b-actions">
+          <button class="btn ghost small" type="button" data-action="ai-brief-refresh" ${brief.state === "loading" ? "disabled" : ""} aria-label="Write the brief again">${brief.state === "loading" ? "Writing…" : "Refresh"}</button>
+          <a class="btn ghost small" href="#coach">Ask</a></div></div>
+        ${body}${err}
+      </section>`;
+    },
+    homeAfter() {
+      if (!provider()) return;
+      if (brief.state === "loading") return;
+      const sig = briefSig();
+      if (sig && sig !== brief.sig) makeBrief(false);
+    },
+    _brief: brief,
+    _context: () => buildContext(),
+  };
+  on("on", "ai-brief-refresh", () => makeBrief(true));
+
   on("onSubmit", "coach-ask", (form, fd) => ask(fd.get("q")));
   on("on", "coach-chip", (el) => ask(el.dataset.q));
+  on("on", "coach-quick", (el) => {
+    const x = QUICK[el.dataset.k];
+    if (x) ask(x.prompt, x.label);
+  });
   on("on", "coach-clear", () => {
     if (coach.streaming) return;
     coach.log = [];
@@ -14932,7 +15348,7 @@ Rules: be concise (under ~180 words unless they ask for a plan). Be specific: ci
     const list = [].concat(Array.isArray(a.METHODS_ANALYTICS) ? a.METHODS_ANALYTICS : [], Array.isArray(a.METHODS_ANALYTICS2) ? a.METHODS_ANALYTICS2 : []).filter((m) => m && (m.title || m.body));
     const para = (t) => String(t == null ? "" : t).split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean).map((p) => `<p>${esc(p)}</p>`).join("");
     const coachLink = App.env && App.env() === "web" && !(App.coachOn && App.coachOn()) && Views.coach
-      ? `<p class="note">Want to ask questions in plain words? An optional <a href="#coach">AI coach</a> runs on your own Anthropic key.</p>` : "";
+      ? `<p class="note">Want to ask questions in plain words? The <a href="#coach">AI coach</a> runs on a free Google Gemini key.</p>` : "";
     return `<div class="card span-2"><details class="in-how"><summary>How this is calculated</summary>` +
       `<p class="muted small">Everything on this page is plain statistics on your own data — no AI. Each result needs a minimum sample and shows its uncertainty.</p>` +
       (list.length ? `<div class="acc">${list.map((m) => `<details><summary>${esc(m.title || "")}</summary><div class="acc-b">${para(m.body)}</div></details>`).join("")}</div>` : `<p class="muted">Method notes are loading.</p>`) +
