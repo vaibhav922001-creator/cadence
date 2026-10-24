@@ -2057,8 +2057,8 @@ details.ui-coll[open] .ui-coll-chev { transform: rotate(90deg); }
 
   /* ---------- plain-language methods ---------- */
   const METHODS = [
-    { title: "Strain (0–21)",
-      body: "Strain measures how much load your heart carried today. Each minute is placed in a heart-rate zone using your heart-rate reserve: the gap between your resting and maximum heart rate. Zones 1 to 5 start at 50, 60, 70, 80 and 90 % of that reserve and count 1 to 5 points per minute. Light movement below zone 1 counts a little. The points are summed into a load, and strain = 21 × load ÷ (load + 90). The scale rises fast at first and slowly near the top, so 21 is never reached. A rest day is about 4–9, a 45-minute steady run about 11–14 and a hard two-hour session about 17–19." },
+    { title: "Strain (% of your target)",
+      body: "Cadence shows strain as a percentage of the top of that day's strain target, which comes from that morning's recovery. 100 % means you reached the most strain your recovery called for; over 100 % means you went past it; a target of 72–100 % means aim for that band. Days without a recovery score use a typical target. Underneath, strain is worked out on a 0–21 scale: it measures how much load your heart carried today. Each minute is placed in a heart-rate zone using your heart-rate reserve: the gap between your resting and maximum heart rate. Zones 1 to 5 start at 50, 60, 70, 80 and 90 % of that reserve and count 1 to 5 points per minute. Light movement below zone 1 counts a little. The points are summed into a load, and strain = 21 × load ÷ (load + 90). The scale rises fast at first and slowly near the top, so 21 is never reached. On that inner scale a rest day is about 4–9, a 45-minute steady run about 11–14 and a hard two-hour session about 17–19. Strain % = strain ÷ top of the day's target × 100." },
     { title: "Sleep need",
       body: "Your need starts from a baseline of 7.5 hours. Once you have 14 nights, it uses your own 30-day average instead, kept between 7 and 9 hours. A hard day adds 5 minutes per strain point above 10. Recent short nights add sleep debt: 33, 22, 13 and 8 % of the shortfall from the last four nights. Naps taken the day before are subtracted. The total stays between 6.5 and 11 hours." },
     { title: "Sleep performance and consistency",
@@ -2066,7 +2066,7 @@ details.ui-coll[open] .ui-coll-chev { transform: rotate(90deg); }
     { title: "Recovery (0–100 %)",
       body: "Recovery compares this morning to your own normal. We take your last 30 days (at least 4 nights; before that, typical values for your age) and measure how far today's numbers sit from your average in standard deviations. HRV counts most (weight 0.5), then resting heart rate (0.25, lower is better), sleep performance (0.22) and breathing rate (0.08, lower is better). The weighted sum is passed through an S-curve to give 1–99 %. Green is 67–100, yellow 34–66 and red 0–33." },
     { title: "Strain target",
-      body: "Your suggested strain follows your recovery. Green days aim for about 14–18.5, yellow days 10–14.5 and red days 4–10. Within each band, a higher recovery moves the target up a little. Bedtime tonight is your usual wake time (median of the last 7 mornings) minus tomorrow's sleep need minus the time you usually take to fall asleep." },
+      body: "Your suggested strain follows your recovery. Green days aim for about 14–18.5, yellow days 10–14.5 and red days 4–10 on the inner 0–21 scale. On screen the top of the target is shown as 100 %, so a green target of 14–18.5 reads about 76–100 %. Within each band, a higher recovery moves the target up a little. Bedtime tonight is your usual wake time (median of the last 7 mornings) minus tomorrow's sleep need minus the time you usually take to fall asleep." },
     { title: "Health monitor",
       body: "Each vital sign is compared with its own 30-day average. A reading more than two standard deviations away is flagged as high or low. Skin temperature uses a fixed ±0.5 °C band around your baseline. Blood oxygen is flagged low below 94 %. A single flag is common and often means a late meal, alcohol, a hard session or a poor night." },
     { title: "Biological age",
@@ -7299,6 +7299,14 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
   /* ============================================================
    * 8. Weekly report (rule-based)
    * ============================================================ */
+  /* strain shown as % of the top of that day's strain target (same rule as App.strainPct in core.js) */
+  const sRef = (dv) => {
+    const t = dv && Array.isArray(dv.strainTarget) && isNum(dv.strainTarget[1]) && dv.strainTarget[1] > 0 ? dv.strainTarget[1] : null;
+    if (t) return t;
+    const r = dv && isNum(dv.recovery) ? dv.recovery : null;
+    return r == null ? 14 : r >= 67 ? 18 : r >= 34 ? 14 : 10;
+  };
+  const sPctA = (v, dv) => (isNum(v) ? (Math.max(0, v) / sRef(dv)) * 100 : null);
   const METRIC_DEFS = [
     // name, unit, getter, better ("up" | "down" | null), noise threshold for "about the same", decimals
     ["Recovery", "%", (d, dv) => dv.recovery, "up", 3, 0],
@@ -7307,7 +7315,7 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
     ["Sleep", "h", (d, dv) => (dv.sleep && isNum(dv.sleep.asleep) ? dv.sleep.asleep / 60 : null), "up", 0.2, 1],
     ["Sleep performance", "%", (d, dv) => dv.sleepPerformance, "up", 3, 0],
     ["Sleep consistency", "%", (d, dv) => dv.sleepConsistency, "up", 3, 0],
-    ["Strain", "", (d, dv) => dv.strain, null, 0.5, 1],
+    ["Strain", "%", (d, dv) => sPctA(dv.strain, dv), null, 4, 0],
     ["Steps", "", (d) => d.steps, "up", 500, 0],
   ];
   const fmtN = (v, dp) => (dp === 0 ? Math.round(v).toLocaleString("en-US") : String(r1(v)));
@@ -7357,7 +7365,7 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
         const sl = derived[k].sleep && derived[k].sleep.asleep;
         const bits = [];
         if (isNum(sl)) bits.push(`${r1(sl / 60)} h sleep`);
-        if (prev >= 0 && isNum(derived[prev].strain)) bits.push(`strain ${derived[prev].strain} the day before`);
+        if (prev >= 0 && isNum(derived[prev].strain)) bits.push(`strain ${Math.round(sPctA(derived[prev].strain, derived[prev]))}% the day before`);
         if (prev >= 0 && hasTag(days[prev], RE_ALC)) bits.push("alcohol the night before");
         return bits.length ? `${good ? "Best" : "Lowest"} recovery after ${bits.join(", ")}.` : "";
       };
@@ -7430,10 +7438,10 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
     }
     if (loadOut && isNum(loadOut.acwr) && loadOut.acwr > 1.3) {
       const capS = plan && plan.days && plan.days[0] ? plan.days[0].hi : null;
-      push(`Load jumped (ratio ${loadOut.acwr}). Keep strain under ${capS != null ? capS : 12} for the next 3 days.`);
+      push(`Load jumped (ratio ${loadOut.acwr}). Keep strain under ${Math.round(sPctA(capS != null ? capS : 12, derived[endIdx]))}% of today's target for the next 3 days.`);
     } else if (loadOut && isNum(loadOut.acwr) && loadOut.acwr < 0.8) {
       const hard = plan && plan.days ? plan.days.find((d) => d.type === "hard") : null;
-      push(`Load is dropping (ratio ${loadOut.acwr}). Add one session${hard ? ` on ${WD[weekdayOf(hard.date)]} at strain ${hard.lo}–${hard.hi}` : ""}.`);
+      push(`Load is dropping (ratio ${loadOut.acwr}). Add one session${hard ? ` on ${WD[weekdayOf(hard.date)]} at strain ${Math.round(sPctA(hard.lo, derived[endIdx]))}–${Math.round(sPctA(hard.hi, derived[endIdx]))}% of today's target` : ""}.`);
     }
     if (sleep.socialJetlagH != null && sleep.socialJetlagH >= 1 && sj.status === "ok")
       push(`Weekend sleep runs ${sleep.socialJetlagH} h ${sj.direction === "later on free days" ? "later" : "earlier"} than weekdays. Keep weekend wake time within 1 h of your weekday time.`);
@@ -7445,7 +7453,7 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
     const rec = mByName("Recovery");
     if (rec.good === false) push(`Recovery fell ${Math.abs(rec.change)} points. Add one full rest day this week.`);
     if (sleep.debtHours != null && sleep.debtHours > 1.5 && sleep.debtHours <= 3) push(`You owe ${sleep.debtHours} h of sleep. Add 30 min a night until it clears.`);
-    if (plan && plan.status && plan.days && plan.days[0]) push(`Tomorrow: aim for strain ${plan.days[0].lo}–${plan.days[0].hi} (${plan.days[0].type} day).`);
+    if (plan && plan.status && plan.days && plan.days[0]) push(`Tomorrow: aim for strain ${Math.round(sPctA(plan.days[0].lo, derived[endIdx]))}–${Math.round(sPctA(plan.days[0].hi, derived[endIdx]))}% of today's target (${plan.days[0].type} day).`);
     push("Keep your routine: same bedtime, same wake time, one easy day after two hard ones.");
     push("Log alcohol, late meals and caffeine in the journal so Cadence can show what helps you.");
 
@@ -9084,31 +9092,39 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
     const barCol = (d) => d.color || BAND[d.band] || recCol(d.recovery);
     const legH = 22;
     const padT = 8 + legH, padB = 24;
-    const padL = Math.ceil(textW("21")) + 10;
-    const padR = Math.ceil(textW("100%")) + 8;
+    // pct mode: strain as % of the day's target and recovery % share one 0–top% axis (top ≥ 100, steps of 50, ≤ 250)
+    const PCT = !!s.pct;
+    const sMax = Math.max(0, ...data.map((d) => (isNum(d.strain) ? d.strain : 0)));
+    const top = PCT ? Math.min(250, Math.max(100, Math.ceil(sMax / 50) * 50)) : 21;
+    const padL = Math.ceil(textW(PCT ? "250%" : "21")) + 10;
+    const padR = PCT ? 10 : Math.ceil(textW("100%")) + 8;
     const pw = Math.max(10, W - padL - padR);
     const ph = Math.max(20, H - padT - padB);
     const n = data.length;
     const step = pw / n;
     const bw = Math.max(1.5, Math.min(step * 0.6, 22));
     const xAt = (i) => padL + step * (i + 0.5);
-    const yS = (v) => padT + ph - (clamp(v, 0, 21) / 21) * ph;
-    const yR = (v) => padT + ph - (clamp(v, 0, 100) / 100) * ph;
+    const yS = (v) => padT + ph - (clamp(v, 0, top) / top) * ph;
+    const yR = (v) => padT + ph - (clamp(v, 0, 100) / (PCT ? top : 100)) * ph;
+    const sLeg = PCT ? "Strain % of target" : "Strain 0–21";
     const base = padT + ph;
 
     let s1 = svgOpen(W, H);
     // legend
     s1 += `<g class="ch-leg">` +
       `<line x1="0" x2="16" y1="9" y2="9" style="stroke:var(--strain)" stroke-width="2.5" stroke-linecap="round"/>` +
-      `<text class="ch-t strong" x="22" y="12.5">Strain 0–21</text>` +
-      `<rect x="${f1(22 + textW("Strain 0–21") + 12)}" y="3" width="10" height="12" rx="2" style="fill:var(--muted);fill-opacity:.55"/>` +
-      `<text class="ch-t strong" x="${f1(22 + textW("Strain 0–21") + 28)}" y="12.5">Recovery %</text></g>`;
-    for (const t of [0, 7, 14, 21]) {
+      `<text class="ch-t strong" x="22" y="12.5">${sLeg}</text>` +
+      `<rect x="${f1(22 + textW(sLeg) + 12)}" y="3" width="10" height="12" rx="2" style="fill:var(--muted);fill-opacity:.55"/>` +
+      `<text class="ch-t strong" x="${f1(22 + textW(sLeg) + 28)}" y="12.5">Recovery %</text></g>`;
+    const ticks = PCT ? Array.from({ length: top / 50 + 1 }, (_, k) => k * 50) : [0, 7, 14, 21];
+    for (const t of ticks) {
       const y = f1(yS(t));
-      s1 += `<line class="ch-grid" x1="${padL}" x2="${W - padR}" y1="${y}" y2="${y}"/>`;
-      s1 += `<text class="ch-t" x="${padL - 7}" y="${f1(+y + 3.5)}" text-anchor="end" style="fill:var(--strain)">${t}</text>`;
-      const rv = Math.round((t / 21) * 100);
-      s1 += `<text class="ch-t" x="${W - padR + 7}" y="${f1(+y + 3.5)}">${rv}%</text>`;
+      s1 += `<line class="ch-grid${PCT && t === 100 ? " ch-ref" : ""}" x1="${padL}" x2="${W - padR}" y1="${y}" y2="${y}"${PCT && t === 100 ? ' style="stroke-dasharray:4 3"' : ""}/>`;
+      s1 += `<text class="ch-t" x="${padL - 7}" y="${f1(+y + 3.5)}" text-anchor="end"${PCT ? "" : ' style="fill:var(--strain)"'}>${t}${PCT ? "%" : ""}</text>`;
+      if (!PCT) {
+        const rv = Math.round((t / 21) * 100);
+        s1 += `<text class="ch-t" x="${W - padR + 7}" y="${f1(+y + 3.5)}">${rv}%</text>`;
+      }
     }
     data.forEach((d, i) => {
       if (!isNum(d.recovery) || d.recovery <= 0) return;
@@ -9143,7 +9159,7 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
       const i = clamp(Math.floor((x - padL) / step), 0, n - 1);
       const d = data[i];
       const lab = d.label == null ? "" : esc(d.label);
-      const sv = isNum(d.strain) ? (Math.round(d.strain * 10) / 10).toFixed(1) : "–";
+      const sv = isNum(d.strain) ? (PCT ? Math.round(d.strain) + "%" : (Math.round(d.strain * 10) / 10).toFixed(1)) : "–";
       const rv = isNum(d.recovery) ? Math.round(d.recovery) + "%" : "–";
       return {
         x: xAt(i),
@@ -10455,6 +10471,11 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
       if (!isNum(v)) return "–";
       return (Math.round(Math.max(0, v) * 10) / 10).toFixed(1);
     },
+    /* strain as a percentage (see strainPct): "85%", "112%" */
+    spct(p) {
+      if (!isNum(p)) return "–";
+      return `${Math.round(Math.max(0, p))}%`;
+    },
     signed(n, dp = 0) {
       if (!isNum(n)) return "–";
       const r = Number(n.toFixed(dp));
@@ -11637,7 +11658,7 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
     const band = (d && d.band) || bandOf(rec);
     const sleep = d ? (isNum(d.sleepPerformance) ? d.sleepPerformance : isNum(d.sleepScore) ? d.sleepScore : null) : null;
     const strain = d && isNum(d.strain) ? d.strain : null;
-    return { rec, band, sleep, strain };
+    return { rec, band, sleep, strain, strainPct: strainPct(strain, d) };
   }
   function statusHtml() {
     return S.mode === "sample"
@@ -11729,7 +11750,7 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
       `<div class="sh-mini-h"><span>${date === todayStr() ? "Today" : "Latest"}</span><span>${esc(fmt.short(date))}</span></div>` +
       item("sleep", "Sleep", "var(--sleep)", st && st.sleep, 100, st ? fmt.pct(st.sleep) : "") +
       item("recovery", "Recovery", bandColor(st && st.band), st && st.rec, 100, st ? fmt.pct(st.rec) : "") +
-      item("strain", "Strain", "var(--strain)", st && st.strain, 21, st ? fmt.strain(st.strain) : "") +
+      item("strain", "Strain", "var(--strain)", st && st.strainPct, 100, st ? fmt.spct(st.strainPct) : "") +
       `</div>`
     );
   }
@@ -12102,6 +12123,26 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
     return !isNum(r) ? [10, 14] : r >= 67 ? [14, 18] : r >= 34 ? [10, 14] : [0, 10];
   }
 
+  /* ---------------- strain as a percentage of the day's target ----------------
+     The engine keeps the 0–21 strain scale for its maths. On screen, strain is shown as a percentage of the top of that
+     day's strain target (set by that day's recovery): 100% = you reached the most your recovery called for; over 100% =
+     you went past it. Days without a target use the target for their recovery band, or the middle band (14). */
+  function strainRef(d) {
+    const t = d && Array.isArray(d.strainTarget) && isNum(d.strainTarget[1]) && d.strainTarget[1] > 0 ? d.strainTarget[1] : null;
+    if (t) return t;
+    const r = d && isNum(d.recovery) ? d.recovery : null;
+    return r == null ? 14 : r >= 67 ? 18 : r >= 34 ? 14 : 10;
+  }
+  function strainPct(v, d) {
+    return isNum(v) ? (Math.max(0, v) / strainRef(d)) * 100 : null;
+  }
+  const strainText = (v, d) => fmt.spct(strainPct(v, d));
+  /* the day's target range in percent: [lo%, 100] */
+  function strainTargetPct(d) {
+    const t = d && Array.isArray(d.strainTarget) && isNum(d.strainTarget[0]) && isNum(d.strainTarget[1]) ? d.strainTarget : null;
+    return t ? [strainPct(t[0], d), strainPct(t[1], d)] : null;
+  }
+
   /* ---------------- coach on the website: the user's own Anthropic API key ----------------
      Same call shape as claude.use("sample"): fn(messages, {onText}) → {text}; errors carry .code */
   const KEY_LS = "cadence.anthropicKey";
@@ -12451,6 +12492,10 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
     bandOf,
     recColor: (v) => bandColor(bandOf(v)),
     strainTarget,
+    strainRef,
+    strainPct,
+    strainText,
+    strainTargetPct,
     sample: {
       use: async () => {
         if (env() === "web") return geminiKey.get() ? geminiSample : apiKey.get() ? apiSample : null;
@@ -12522,7 +12567,9 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
   const esc = (s) => App.esc(s == null ? "" : String(s));
   const mins = (m) => (isNum(m) ? App.fmt.mins(Math.round(m)) : DASH);
   const label = (date) => App.fmt.short(date);
-  const fStrain = (v) => (!isNum(v) ? DASH : App.fmt && App.fmt.strain ? App.fmt.strain(v) : (Math.round(v * 10) / 10).toFixed(1));
+  /* strain on screen: % of the top of that day's strain target (App.strainPct); d = the day's derived record */
+  const sPct = (v, d) => (isNum(v) ? (App.strainPct ? App.strainPct(v, d) : (v / 14) * 100) : null);
+  const fStrain = (v, d) => (!isNum(v) ? DASH : `${Math.round(Math.max(0, sPct(v, d)))}%`);
   const bandOf = (v) => (!isNum(v) ? null : v >= 67 ? "green" : v >= 34 ? "yellow" : "red");
   const bandColor = (b) => (App.bandColor ? App.bandColor(b) : b ? `var(--${b})` : "var(--muted)");
   const perfColor = (v) => (!isNum(v) ? "var(--muted)" : v >= 85 ? "var(--green)" : v >= 70 ? "var(--yellow)" : "var(--red)");
@@ -12587,11 +12634,15 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
     if (!isNum(d.strain)) return d.strainReason === "insufficient_hr_data" || d.strainReason == null ? "No heart-rate data for this day" : "";
     return Math.round(d.strain * 10) === 0 ? "No minutes above your effort threshold" : "";
   };
+  const strainExplain = (d) => {
+    const t = d && Array.isArray(d.strainTarget) && isNum(d.strainTarget[1]) ? d.strainTarget : null;
+    return t ? "100% = the most strain your recovery called for that day" : "100% = a typical day's strain target (no recovery score this day)";
+  };
   const strainTip = (d, html) => {
     const t = strainNote(d);
     return t ? `<span class="cv-tip" title="${esc(t)}">${html}</span>` : html;
   };
-  const strainPill = (v) => `<span class="pill cv-spill num" aria-label="Strain ${fStrain(v)}">${fStrain(v)}</span>`;
+  const strainPill = (v, d) => `<span class="pill cv-spill num" aria-label="Strain ${fStrain(v, d)}">${fStrain(v, d)}</span>`;
   const emptyCard = (title, text, cls) => `<div class="card ${cls || ""}"><div class="empty"><h2>${title}</h2><p class="muted">${text}</p></div></div>`;
   /** v4 dial (Charts.ring variant "dial"), with an aria label like "Recovery 62 %". */
   const dial = (o) => Charts.ring(Object.assign({ variant: "dial", size: 156 }, o));
@@ -12644,13 +12695,13 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
     return ((d && d.workouts) || []).slice().sort((x, y) => String(x.start || "").localeCompare(String(y.start || "")));
   }
 
-  function workoutRow(w) {
+  function workoutRow(w, d) {
     const t = clockOf(w.start);
     const bits = [mins(w.durationMin)];
     if (isNum(w.avgHr)) bits.push(`avg ${Math.round(w.avgHr)} bpm`);
     if (isNum(w.kcal)) bits.push(`${App.fmt.num(w.kcal)} kcal`);
     const manual = w.source === "Manual";
-    return `<div class="row cv-wrow">${strainPill(w.strain)}` +
+    return `<div class="row cv-wrow">${strainPill(w.strain, d)}` +
       `<span class="cv-wmain"><strong>${esc(w.type || "Workout")}</strong>` +
       `${t !== DASH ? ` <span class="muted num">${esc(t)}</span>` : ""}${manual ? ` <span class="chip neutral">Manual</span>` : ""}` +
       `<span class="muted num cv-wmeta">${bits.join(" · ")}</span></span></div>`;
@@ -12658,14 +12709,14 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
 
   function activityList(d, emptyText) {
     const ws = workoutsOf(d);
-    return `<div class="list">${ws.length ? ws.map(workoutRow).join("") : `<div class="row muted">${emptyText}</div>`}</div>`;
+    return `<div class="list">${ws.length ? ws.map((w) => workoutRow(w, d)).join("") : `<div class="row muted">${emptyText}</div>`}</div>`;
   }
 
   function targetStatus(d) {
     const t = d && Array.isArray(d.strainTarget) && isNum(d.strainTarget[0]) && isNum(d.strainTarget[1]) ? d.strainTarget : null;
     if (!t || !isNum(d.strain)) return null;
     const where = d.strain < t[0] ? "below" : d.strain <= t[1] ? "in" : "above";
-    return { lo: t[0], hi: t[1], where, level: where === "in" ? "good" : where === "below" ? "neutral" : "warn",
+    return { lo: t[0], hi: t[1], loPct: sPct(t[0], d), hiPct: sPct(t[1], d), where, level: where === "in" ? "good" : where === "below" ? "neutral" : "warn",
       text: where === "in" ? "In target" : where === "below" ? "Below target" : "Above target" };
   }
 
@@ -12834,8 +12885,8 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
     const ts = targetStatus(d);
     const today = isToday(d.date);
     if (ts) {
-      const rng = `<span class="num">${fStrain(ts.lo)}–${fStrain(ts.hi)}</span>`;
-      const s = `<span class="num">${fStrain(d.strain)}</span>`;
+      const rng = `<span class="num">${fStrain(ts.lo, d)}–${fStrain(ts.hi, d)}</span>`;
+      const s = `<span class="num">${fStrain(d.strain, d)}</span>`;
       if (today) {
         out.push(ts.where === "below" ? `Strain ${s} so far; today's target is ${rng}.`
           : ts.where === "in" ? `Strain ${s}, inside today's ${rng} target.`
@@ -12844,7 +12895,7 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
         out.push(`Strain finished at ${s}, ${ts.where === "in" ? "inside" : ts.where} the ${rng} target.`);
       }
     } else if (isNum(d.strain)) {
-      out.push(`Strain ${today ? "is" : "finished at"} <span class="num">${fStrain(d.strain)}</span>.`);
+      out.push(`Strain ${today ? "is" : "finished at"} <span class="num">${fStrain(d.strain, d)}</span> of a typical target.`);
     }
     return out;
   }
@@ -12892,11 +12943,11 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
       const col = isNum(rec) ? bandColor(dd.band || bandOf(rec)) : "var(--muted)";
       const dow = esc(App.fmt.day(date).split(" ")[0]);
       const rh = isNum(rec) ? clampPct(rec) : 0;
-      const sh = isNum(dd.strain) ? clampPct((dd.strain / 21) * 100) : 0;
-      const aria = `${App.fmt.day(date)}: recovery ${isNum(rec) ? Math.round(rec) + " %" : "none"}, strain ${fStrain(dd.strain)}`;
+      const sh = isNum(dd.strain) ? clampPct(sPct(dd.strain, dd)) : 0;
+      const aria = `${App.fmt.day(date)}: recovery ${isNum(rec) ? Math.round(rec) + " %" : "none"}, strain ${fStrain(dd.strain, dd)}`;
       return `<button class="ov-wd${k === ctx.i ? " on" : ""}" type="button" data-action="core-sel" data-date="${esc(date)}" style="--c:${col}" aria-label="${esc(aria)}"${k === ctx.i ? ' aria-current="date"' : ""}>` +
         `<span class="ov-wl">${dow}</span><span class="ov-bars" aria-hidden="true"><span class="ov-br" style="height:${rh.toFixed(0)}%"></span><span class="ov-bs" style="height:${sh.toFixed(0)}%"></span></span>` +
-        `<span class="ov-wr num">${isNum(rec) ? Math.round(rec) : DASH}</span><span class="ov-ws num">${fStrain(dd.strain)}</span></button>`;
+        `<span class="ov-wr num">${isNum(rec) ? Math.round(rec) : DASH}</span><span class="ov-ws num">${fStrain(dd.strain, dd)}</span></button>`;
     }).join("");
     return `<div class="card span-2">${head("Last 7 days", `<span class="key" style="--c:var(--green)">recovery %</span> <span class="key" style="--c:var(--strain)">strain</span>`)}<div class="ov-week">${cells}</div></div>`;
   }
@@ -12975,8 +13026,8 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
       if (w.source === "Manual") bits.push("logged");
       const st = toDate(w.start);
       const en = st && !isNaN(st) && isNum(w.durationMin) ? new Date(st.getTime() + w.durationMin * 60000) : null;
-      rows.push(C.activityRow({ kind: "strain", chip: fStrain(w.strain), title: w.type || "Workout", sub: bits.join(" · "),
-        start: clockOf(w.start), end: en ? clockOf(en) : "", view: "strain", aria: `${w.type || "Workout"}, strain ${fStrain(w.strain)}. Open Strain` }));
+      rows.push(C.activityRow({ kind: "strain", chip: fStrain(w.strain, d), title: w.type || "Workout", sub: bits.join(" · "),
+        start: clockOf(w.start), end: en ? clockOf(en) : "", view: "strain", aria: `${w.type || "Workout"}, strain ${fStrain(w.strain, d)}. Open Strain` }));
     }
     const actsBody = (rows.length ? `<div class="ui-acts">${rows.join("")}</div>` : C.reason({ title: "Nothing logged yet", text: today ? "Your sleep and workouts show up here." : "No sleep or workouts on this day." })) +
       `<button class="ui-add" type="button" data-action="core-go" data-view="journal">${C.icon("plus", 18, 2.2)}Add activity</button>`;
@@ -13027,8 +13078,8 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
         C.scoreDial({ kind: "sleep", size: "md", value: isNum(perf) ? perf : null, view: "sleep", label: "Sleep" }) +
         C.scoreDial({ kind: "recovery", size: "md", value: isNum(rec) ? rec : null, color: bandColor(band), view: "recovery",
           aria: `Recovery ${isNum(rec) ? Math.round(rec) + " percent" + (band ? ", " + band : "") : "not scored"}. Open Recovery` }) +
-        strainTip(d, C.scoreDial({ kind: "strain", size: "md", value: isNum(d.strain) ? d.strain : null, max: 21, view: "strain", target: ts ? [ts.lo, ts.hi] : null,
-          aria: `Strain ${fStrain(d.strain)} of 21${strainNote(d) ? ". " + strainNote(d) : ""}. Open Strain` }));
+        strainTip(d, C.scoreDial({ kind: "strain", size: "md", value: sPct(d.strain, d), max: 100, unit: "%", display: isNum(d.strain) ? String(Math.round(sPct(d.strain, d))) : "", view: "strain", target: ts ? [ts.loPct, ts.hiPct] : null,
+          aria: `Strain ${fStrain(d.strain, d)} of today's target${strainNote(d) ? ". " + strainNote(d) : ""}. Open Strain` }));
       const [hl] = headline(band);
       const lines = insights(ctx);
       const items = [{ title: hl, bodyHtml: lines[0] || "" }];
@@ -13201,7 +13252,7 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
         : band === "green" ? "Well recovered. Your body has absorbed recent load and is ready for more."
         : band === "yellow" ? "Partly recovered. Training is fine; keep the hardest efforts measured."
         : "Under-recovered. Easy movement, good food and an early night will help most.";
-      const insight = `<p class="insight">${lead}${ts ? ` Today's strain target is <span class="num">${fStrain(ts.lo)}–${fStrain(ts.hi)}</span>.` : ""}</p>`;
+      const insight = `<p class="insight">${lead}${ts ? ` Today's strain target is <span class="num">${fStrain(ts.lo, d)}–${fStrain(ts.hi, d)}</span>.` : ""}</p>`;
 
       const recBars = idx.map((k) => {
         const dd = ctx.derived[k] || {};
@@ -13259,16 +13310,18 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
       const share = isNum(d.activityStrainShare) ? Math.round(d.activityStrainShare * 100) : null;
       const tgt = Array.isArray(d.strainTarget) && isNum(d.strainTarget[0]) && isNum(d.strainTarget[1]) ? d.strainTarget : null;
       const sNote = strainNote(d);
-      const hero = `<div class="dv-hero">${strainTip(d, C.scoreDial({ kind: "strain", size: "lg", value: isNum(d.strain) ? d.strain : null, max: 21, target: tgt,
+      const hero = `<div class="dv-hero">${strainTip(d, C.scoreDial({ kind: "strain", size: "lg", value: sPct(d.strain, d), max: 100, unit: "%", display: isNum(d.strain) ? String(Math.round(sPct(d.strain, d))) : "",
+        target: tgt ? [sPct(tgt[0], d), sPct(tgt[1], d)] : null,
         chip: today ? "So far" : "", caption: !isNum(d.strain) ? sNote : "",
-        aria: `Strain ${fStrain(d.strain)} of 21${today ? " so far" : ""}${tgt ? `, target ${fStrain(tgt[0])} to ${fStrain(tgt[1])}` : ""}${sNote ? ". " + sNote : ""}` }))}</div>`;
+        aria: `Strain ${fStrain(d.strain, d)} of ${today ? "today's" : "the day's"} target${today ? " so far" : ""}${tgt ? `, target ${fStrain(tgt[0], d)} to ${fStrain(tgt[1], d)}` : ""}${sNote ? ". " + sNote : ""}` }))}</div>` +
+        `<p class="muted cv-note sp-explain">${esc(strainExplain(d))}</p>`;
       const zl = (j) => { const zz = ctx.derived[j] && ctx.derived[j].zones; return Array.isArray(zz) ? (zz[1] || 0) + (zz[2] || 0) + (zz[3] || 0) : null; };
       const zh = (j) => { const zz = ctx.derived[j] && ctx.derived[j].zones; return Array.isArray(zz) ? (zz[4] || 0) + (zz[5] || 0) : null; };
       const lm = zMin[0] + zMin[1] + zMin[2], vp = zMin[3] + zMin[4];
       const aL = avg30(ctx, zl), aH = avg30(ctx, zh), aS = avg30(ctx, (j) => ctx.days[j].steps), aD = avg30(ctx, (j) => ctx.days[j].distanceM);
       const aK = avg30(ctx, (j) => { const x = ctx.derived[j] && ctx.derived[j].kcal; return x && isNum(x.total) ? x.total : ctx.days[j].totalKcal; });
       const rows = [
-        C.keyStatRow({ icon: "flame", label: "Strain target", value: tgt ? `${fStrain(tgt[0])} – ${fStrain(tgt[1])}` : DASH, sub: ts ? ts.text : "Needs a recovery score" }),
+        C.keyStatRow({ icon: "flame", label: "Strain target", value: tgt ? `${fStrain(tgt[0], d)} – ${fStrain(tgt[1], d)}` : DASH, sub: ts ? ts.text : "Needs a recovery score" }),
         C.keyStatRow(Object.assign({ icon: "heart", label: "Light to moderate zones", value: hm(lm), sub: isNum(aL) ? hm(aL) : "" }, trendOf(lm, aL, true, 3))),
         C.keyStatRow(Object.assign({ icon: "pulse", label: "Vigorous and peak zones", value: hm(vp), sub: isNum(aH) ? hm(aH) : "" }, trendOf(vp, aH, true, 2))),
         C.keyStatRow(Object.assign({ icon: "steps", label: "Steps", value: isNum(day.steps) ? App.fmt.num(day.steps) : DASH, sub: isNum(aS) ? App.fmt.num(aS) : "" }, trendOf(day.steps, aS, true))),
@@ -13277,7 +13330,7 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
       ].join("");
       const card = C.card({ notch: true, body: `<div class="ui-rows">${rows}</div>`, aria: "Strain details" });
       const insight = ts
-        ? `<p class="insight strain">${ts.where === "below" ? (today ? `Room for <span class="num">${fStrain(Math.max(0, ts.lo - d.strain))}</span> more to reach the low end of today's target.` : "Finished under target: a lighter day than recovery allowed.")
+        ? `<p class="insight strain">${ts.where === "below" ? (today ? `Room for <span class="num">${Math.round(Math.max(0, ts.loPct - sPct(d.strain, d)))} points</span> more to reach the low end of today's target (${fStrain(ts.lo, d)}).` : "Finished under target: a lighter day than recovery allowed.")
           : ts.where === "in" ? "Load matches how recovered you were. A good place to stop."
           : `You are past ${today ? "today's" : "the day's"} target. Prioritise sleep tonight to recover.`}</p>`
         : `<p class="insight strain">A strain target appears on days with a recovery score.</p>`;
@@ -13287,7 +13340,7 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
       const zoneCard = `<div class="card">${head("Heart-rate zones", zTotal ? `<span class="num">${mins(zTotal)}</span> above 50% HRR` : "")}` +
         (zTotal ? meters(zRows) : `<p class="muted">No time above zone 1 on this day.</p>`) +
         `<p class="muted cv-note">Zones are % of heart-rate reserve: Z1 50–60, Z2 60–70, Z3 70–80, Z4 80–90, Z5 90+.</p></div>`;
-      const actRows = ws.map((w) => C.activityRow({ kind: "strain", chip: fStrain(w.strain), title: w.type || "Workout",
+      const actRows = ws.map((w) => C.activityRow({ kind: "strain", chip: fStrain(w.strain, d), title: w.type || "Workout",
         sub: [mins(w.durationMin), isNum(w.avgHr) ? `avg ${Math.round(w.avgHr)} bpm` : "", isNum(w.kcal) ? `${App.fmt.num(w.kcal)} kcal` : "", w.source === "Manual" ? "logged" : ""].filter(Boolean).join(" · "),
         start: clockOf(w.start) })).join("");
       const actCard = `<div class="card">${head("Activities", share !== null ? `<span class="num">${share}%</span> of load` : "")}` +
@@ -13298,12 +13351,12 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
       const idx = windowIdx(ctx, 30);
       const series = idx.map((j) => {
         const dd = ctx.derived[j] || {};
-        return { label: label(ctx.days[j].date), strain: isNum(dd.strain) ? dd.strain : null, recovery: isNum(dd.recovery) ? dd.recovery : null,
+        return { label: label(ctx.days[j].date), strain: isNum(dd.strain) ? sPct(dd.strain, dd) : null, recovery: isNum(dd.recovery) ? dd.recovery : null,
           color: isNum(dd.recovery) ? bandColor(dd.band || bandOf(dd.recovery)) : "var(--muted)" };
       });
       const sv = series.map((x) => x.strain).filter(isNum);
-      const lineCard = `<div class="card span-2">${head("Strain and recovery", sv.length ? `30-day avg strain <span class="num">${fStrain(avg(sv))}</span>` : "last 30 days")}` +
-        (sv.length ? Charts.slot({ type: "strainline", data: series, height: 200 }) : `<p class="muted">No strain history yet.</p>`) + `</div>`;
+      const lineCard = `<div class="card span-2">${head("Strain and recovery", sv.length ? `30-day avg strain <span class="num">${Math.round(avg(sv))}%</span>` : "last 30 days")}` +
+        (sv.length ? Charts.slot({ type: "strainline", pct: true, data: series, height: 200 }) : `<p class="muted">No strain history yet.</p>`) + `</div>`;
       return `<div class="page one-col dv v-strain"><div class="dv-top">${hero}<div>${card}</div></div>${insight}` +
         `<div class="grid cv-grid">${actCard}${zoneCard}${hrCard}${lineCard}</div></div>`;
     },
@@ -13404,11 +13457,10 @@ html[data-hdr="title"] .pb-sum{margin-top:0}
     const c = App.bandColor ? App.bandColor(b) : null;
     return typeof c === "string" && c ? c : BAND_VAR[b] || "var(--muted)";
   };
-  const strainF = (v) => {
-    if (!isNum(v)) return "—";
-    const f = F().strain;
-    return typeof f === "function" ? f(v) : v.toFixed(1);
-  };
+  /* strain on screen: % of the top of that day's strain target (App.strainPct); d = that day's derived record */
+  const sPct = (v, d) => (isNum(v) ? (App.strainPct ? App.strainPct(v, d) : (v / 14) * 100) : null);
+  const strainF = (v, d) => (isNum(v) ? `${Math.round(Math.max(0, sPct(v, d)))}%` : "—");
+  const pctF = (p) => (isNum(p) ? `${Math.round(p)}%` : "—");
   const needOf = (d) => (!d ? null : isNum(d.sleepNeed) ? d.sleepNeed : d.sleepNeed && isNum(d.sleepNeed.total) ? d.sleepNeed.total : null);
   const perfOf = (d) => (!d ? null : isNum(d.sleepPerformance) ? d.sleepPerformance : isNum(d.sleepScore) ? d.sleepScore : null);
   const asleepOf = (d) => (d && d.sleep && isNum(d.sleep.asleep) ? d.sleep.asleep : null);
@@ -13716,7 +13768,7 @@ html[data-hdr="title"] .pb-sum{margin-top:0}
               (w) => `<div class="row jr-row">
           <div><strong>${esc(w.type || "Workout")}</strong> ${w.manual ? '<span class="chip neutral">Logged</span>' : ""}
           <div class="muted num">${[startClock(w), isNum(w.durationMin) ? fmt.mins(w.durationMin) : "", isNum(w.avgHr) ? `${n(w.avgHr)} bpm avg` : "", isNum(w.kcal) ? `${n(w.kcal)} kcal` : ""].filter(Boolean).join(" · ")}</div></div>
-          <div class="jr-w-end">${isNum(w.strain) ? `<span class="jr-strain num" title="Activity strain">${strainF(w.strain)}</span>` : ""}
+          <div class="jr-w-end">${isNum(w.strain) ? `<span class="jr-strain num" title="Activity strain, % of the day's target">${strainF(w.strain, d)}</span>` : ""}
           ${w.manual ? `<button class="btn ghost small" data-action="jr-del-workout" data-id="${esc(w.id)}" aria-label="Delete ${esc(w.type || "activity")}">Delete</button>` : ""}</div>
         </div>`,
             )
@@ -13975,7 +14027,7 @@ html[data-hdr="title"] .pb-sum{margin-top:0}
     return [...groups.entries()].slice(-8).reverse().map(([wk, ks]) => ({
       week: wk,
       rec: avg(ks.map((k) => derived[k] && derived[k].recovery)),
-      strain: avg(ks.map((k) => derived[k] && derived[k].strain)),
+      strain: avg(ks.map((k) => derived[k] && sPct(derived[k].strain, derived[k]))),
       perf: avg(ks.map((k) => perfOf(derived[k]))),
       asleep: avg(ks.map((k) => asleepOf(derived[k]))),
       hrv: avg(ks.map((k) => days[k].hrv)),
@@ -14181,15 +14233,16 @@ html[data-hdr="title"] .pb-sum{margin-top:0}
         `<span class="tr-counts num">${["green", "yellow", "red"].map((b) => `<span class="key" style="--c:${bandColor(b)}">${counts[b]}</span>`).join("")}</span>`,
       );
 
-      // Strain 0–21
-      const stF = (k) => dv(k).strain;
+      // Strain, % of each day's target
+      const stF = (k) => sPct(dv(k).strain, dv(k));
       const stAvg = avg(cur.map(stF));
+      const stTop = Math.max(100, Math.ceil(Math.max(0, ...cur.map(stF).filter(isNum)) / 50) * 50);
       const strainCard = card(
         "Strain",
-        "0–21",
-        isNum(stAvg) ? strainF(stAvg) : "—",
-        deltaChip(stF, 0, 1, ""),
-        has(stF) ? Charts.slot({ type: "bars", data: cur.map((k) => ({ label: lbl(k), v: isNum(stF(k)) ? stF(k) : null })), color: "var(--strain)", height: H, max: 21, fmt: (x) => App.fmt.num(x, x % 1 ? 1 : 0) }) : none("strain"),
+        "% of target",
+        pctF(stAvg),
+        deltaChip(stF, 0, 0, " pts"),
+        has(stF) ? Charts.slot({ type: "bars", data: cur.map((k) => ({ label: lbl(k), v: isNum(stF(k)) ? stF(k) : null })), color: "var(--strain)", height: H, max: stTop, ref: { v: 100, label: "Target" }, fmt: (x) => App.fmt.num(x) + "%" }) : none("strain"),
       );
 
       const perfCard = lineCard("Sleep performance", "%", (k) => perfOf(dv(k)), "var(--sleep)", 1, 0, { yMin: 0, yMax: 100, band: [85, 100] });
@@ -14234,10 +14287,11 @@ html[data-hdr="title"] .pb-sum{margin-top:0}
       const slData = cur.map((k) => {
         const d = dv(k);
         const b = bandOfD(d);
-        return { label: lbl(k), strain: isNum(d.strain) ? d.strain : null, recovery: isNum(d.recovery) ? d.recovery : null, band: b, v: isNum(d.strain) ? d.strain : null, color: bandColor(b) };
+        const p = sPct(d.strain, d);
+        return { label: lbl(k), strain: p, recovery: isNum(d.recovery) ? d.recovery : null, band: b, v: p, color: bandColor(b) };
       });
-      let slHtml = Charts.slot({ type: "strainline", data: slData, height: 220, label: "Daily strain against recovery" });
-      if (!slHtml) slHtml = Charts.slot({ type: "bars", data: slData.map((x) => ({ label: x.label, v: x.v, color: x.color })), max: 21, height: 200, fmt: (x) => App.fmt.num(x, x % 1 ? 1 : 0) });
+      let slHtml = Charts.slot({ type: "strainline", pct: true, data: slData, height: 220, label: "Daily strain against recovery" });
+      if (!slHtml) slHtml = Charts.slot({ type: "bars", data: slData.map((x) => ({ label: x.label, v: x.v, color: x.color })), height: 200, fmt: (x) => App.fmt.num(x) + "%" });
       const loadCard = `<div class="card span-2">${cardHead("Load vs recovery", `<span class="legend"><span class="key" style="--c:var(--strain)">Strain</span>${["green", "yellow", "red"].map((b) => `<span class="key" style="--c:${bandColor(b)}">${b === "green" ? "Ready" : b === "yellow" ? "Steady" : "Run down"}</span>`).join("")}</span>`)}
         ${cur.some((k) => isNum(dv(k).strain)) ? slHtml : none("strain")}
         <p class="muted tr-note">High strain on red days digs a hole; high strain on green days builds fitness.</p></div>`;
@@ -14246,7 +14300,7 @@ html[data-hdr="title"] .pb-sum{margin-top:0}
       const wkTable = `<div class="mv-scroll"><table class="mv-table"><thead><tr><th>Week of</th><th>Recovery</th><th>Strain</th><th>Sleep perf.</th><th>Asleep</th><th>HRV</th></tr></thead><tbody>${wk
         .map((w) => {
           const b = bandOf(w.rec);
-          return `<tr><td>${fmt.short(w.week)}</td><td class="num">${isNum(w.rec) ? `<span class="mv-dot" style="--c:${bandColor(b)}"></span>${n(w.rec)}%` : "—"}</td><td class="num">${strainF(w.strain)}</td><td class="num">${isNum(w.perf) ? n(w.perf) + "%" : "—"}</td><td class="num">${isNum(w.asleep) ? fmt.mins(Math.round(w.asleep)) : "—"}</td><td class="num">${isNum(w.hrv) ? n(w.hrv) + " ms" : "—"}</td></tr>`;
+          return `<tr><td>${fmt.short(w.week)}</td><td class="num">${isNum(w.rec) ? `<span class="mv-dot" style="--c:${bandColor(b)}"></span>${n(w.rec)}%` : "—"}</td><td class="num">${pctF(w.strain)}</td><td class="num">${isNum(w.perf) ? n(w.perf) + "%" : "—"}</td><td class="num">${isNum(w.asleep) ? fmt.mins(Math.round(w.asleep)) : "—"}</td><td class="num">${isNum(w.hrv) ? n(w.hrv) + " ms" : "—"}</td></tr>`;
         })
         .join("")}</tbody></table></div>`;
 
@@ -14255,7 +14309,7 @@ html[data-hdr="title"] .pb-sum{margin-top:0}
       const trHero = hero({
         eyebrow: esc(rangeLabel),
         title: "Trends",
-        sum: banded ? `<strong class="num">${greens}</strong> of <strong class="num">${banded}</strong> days in the green${isNum(stAvg) ? `, average strain <strong class="num">${strainF(stAvg)}</strong>` : ""}.` : "No recovery scores in this range yet.",
+        sum: banded ? `<strong class="num">${greens}</strong> of <strong class="num">${banded}</strong> days in the green${isNum(stAvg) ? `, average strain <strong class="num">${pctF(stAvg)}</strong> of target` : ""}.` : "No recovery scores in this range yet.",
         num: recAvg,
         numText: isNum(recAvg) ? countUp(recAvg, 0) : null,
         unit: "%",
@@ -14396,23 +14450,23 @@ html[data-hdr="title"] .pb-sum{margin-top:0}
     const last = days.length - 1;
     const r = (v, dp) => (isNum(v) ? (dp ? v.toFixed(dp) : String(Math.round(v))) : "");
     const q = (s) => `"${String(s).replace(/"/g, "'")}"`;
-    const rows = ["date,recovery,band,strain,sleepPerf,asleepMin,needMin,hrv,rhr,resp,zoneMin_z1-z5,workouts,tags,outOfRange"];
+    const rows = ["date,recovery,band,strainPct,strain0to21,sleepPerf,asleepMin,needMin,hrv,rhr,resp,zoneMin_z1-z5,workouts,tags,outOfRange"];
     for (const k of windowIdx(last, 30)) {
       const day = days[k], d = derived[k] || {};
       const ws = workoutsOf(day, d)
-        .map((w) => `${w.type} ${isNum(w.durationMin) ? w.durationMin : "?"}m${isNum(w.avgHr) ? " " + w.avgHr + "bpm" : ""}${isNum(w.strain) ? " strain " + w.strain.toFixed(1) : ""}`)
+        .map((w) => `${w.type} ${isNum(w.durationMin) ? w.durationMin : "?"}m${isNum(w.avgHr) ? " " + w.avgHr + "bpm" : ""}${isNum(w.strain) ? " strain " + Math.round(sPct(w.strain, d)) + "%" : ""}`)
         .join("; ");
       const tags = ((day.entry && day.entry.journal && day.entry.journal.tags) || []).join("; ");
       const z = Array.isArray(d.zones) ? d.zones.slice(1, 6).map((x) => r(x)).join("/") : "";
       const mon = d.monitor && typeof d.monitor === "object"
         ? Object.entries(d.monitor).filter(([, m]) => m && (m.status === "high" || m.status === "low")).map(([kk, m]) => `${kk} ${m.status}`).join("; ")
         : "";
-      rows.push([day.date, r(d.recovery), bandOfD(d) || "", r(d.strain, 1), r(perfOf(d)), r(asleepOf(d)), r(needOf(d)), r(day.hrv), r(day.restingHr), r(day.respRate, 1), z, q(ws), q(tags), q(mon)].join(","));
+      rows.push([day.date, r(d.recovery), bandOfD(d) || "", r(sPct(d.strain, d)), r(d.strain, 1), r(perfOf(d)), r(asleepOf(d)), r(needOf(d)), r(day.hrv), r(day.restingHr), r(day.respRate, 1), z, q(ws), q(tags), q(mon)].join(","));
     }
     const k90 = windowIdx(last, 90);
     const a90 = (f) => avg(k90.map(f));
     const dl = derived[last] || {};
-    const target = Array.isArray(dl.strainTarget) && isNum(dl.strainTarget[0]) ? `${dl.strainTarget[0]}–${dl.strainTarget[1]}` : "";
+    const target = Array.isArray(dl.strainTarget) && isNum(dl.strainTarget[0]) ? `${r(sPct(dl.strainTarget[0], dl))}–100%` : "";
     let ba = null;
     try { ba = E.bioAge ? E.bioAge(days, derived, p, last) : null; } catch (e) { ba = null; }
     let imp = [];
@@ -14422,14 +14476,14 @@ html[data-hdr="title"] .pb-sum{margin-top:0}
     return [
       `Profile: age ${p.age}, sex ${p.sex}, height ${p.heightCm} cm, weight ${p.weightKg} kg, max HR ${E.maxHrOf ? E.maxHrOf(p) : ""}.`,
       App.mode && App.mode() === "sample" ? "Note: this is built-in SAMPLE data, not the viewer's real data." : "",
-      `Scales: strain 0–21 (cardio load, log-like; 21 is near impossible). Recovery 0–100% with bands green 67–100, yellow 34–66, red 0–33. Sleep performance = % of computed sleep need. Zone minutes z1–z5 by heart-rate reserve.`,
-      `Latest day: ${days[last].date}. Recovery ${r(dl.recovery)}% (${bandOfD(dl) || "no band"}), strain ${r(dl.strain, 1)}${target ? `, suggested strain today ${target}` : ""}, sleep performance ${r(perfOf(dl))}%, sleep need ${r(needOf(dl))} min.`,
+      `Scales: strain is shown to the user as a percentage of the top of that day's strain target (100% = the most strain that day's recovery called for; over 100% = went past it). The CSV also has the raw engine strain 0–21 (cardio load, log-like) for reference; always talk to the user in strain %. Recovery 0–100% with bands green 67–100, yellow 34–66, red 0–33. Sleep performance = % of computed sleep need. Zone minutes z1–z5 by heart-rate reserve.`,
+      `Latest day: ${days[last].date}. Recovery ${r(dl.recovery)}% (${bandOfD(dl) || "no band"}), strain ${r(sPct(dl.strain, dl))}% of target${target ? `, suggested strain today ${target}` : ""}, sleep performance ${r(perfOf(dl))}%, sleep need ${r(needOf(dl))} min.`,
       "",
       "Last 30 days (CSV; outOfRange lists vitals outside the user's normal range):",
       rows.join("\n"),
       "",
       `Last 30 days recovery bands: ${counts.green} green, ${counts.yellow} yellow, ${counts.red} red.`,
-      `90-day averages: recovery ${r(a90((k) => derived[k] && derived[k].recovery))}%, strain ${r(a90((k) => derived[k] && derived[k].strain), 1)}, sleep performance ${r(a90((k) => perfOf(derived[k])))}%, asleep ${r(a90((k) => asleepOf(derived[k])))} min, HRV ${r(a90((k) => days[k].hrv))} ms, resting HR ${r(a90((k) => days[k].restingHr))} bpm, steps ${r(a90((k) => days[k].steps))}.`,
+      `90-day averages: recovery ${r(a90((k) => derived[k] && derived[k].recovery))}%, strain ${r(a90((k) => derived[k] && sPct(derived[k].strain, derived[k])))}% of target, sleep performance ${r(a90((k) => perfOf(derived[k])))}%, asleep ${r(a90((k) => asleepOf(derived[k])))} min, HRV ${r(a90((k) => days[k].hrv))} ms, resting HR ${r(a90((k) => days[k].restingHr))} bpm, steps ${r(a90((k) => days[k].steps))}.`,
       ba && isNum(ba.age)
         ? `Biological age estimate: ${ba.age.toFixed(1)} (calendar ${ba.chronological})${isNum(ba.pace) ? `; pace of aging ${ba.pace.toFixed(2)}x (${paceLabelOf(ba)})` : ""}; components: ${(ba.parts || []).filter((x) => x && isNum(x.years)).map((x) => `${x.key} ${x.years >= 0 ? "+" : ""}${x.years.toFixed(1)} yr${x.detail ? ` (${x.detail})` : ""}`).join("; ")}.`
         : "Biological age: not enough data.",
@@ -14457,8 +14511,8 @@ html[data-hdr="title"] .pb-sum{margin-top:0}
       out.push(`This week (${wr.period.start} to ${wr.period.end}) vs last week: ${(wr.metrics || []).map((m) => `${m.name} ${r1(m.thisWeek, m.unit === "h" ? 1 : 0)}${m.unit || ""} (${isNum(m.change) ? (m.change >= 0 ? "+" : "") + r1(m.change, m.unit === "h" ? 1 : 0) : "?"}${m.good === true ? ", better" : m.good === false ? ", worse" : ""})`).join("; ")}.`);
       if (wr.bestDay) out.push(`Best day this week: ${wr.bestDay.date} — ${wr.bestDay.note || ""}`);
       if (wr.toughestDay) out.push(`Toughest day this week: ${wr.toughestDay.date} — ${wr.toughestDay.note || ""}`);
-      if (wr.load) out.push(`Training load (Banister model): fitness CTL ${r1(wr.load.ctl, 1)}, fatigue ATL ${r1(wr.load.atl, 1)}, form TSB ${r1(wr.load.tsb, 1)}, acute:chronic ratio ${r1(wr.load.acwr, 2)} (${wr.load.status}), week strain total ${r1(wr.load.totalStrain, 1)}.`);
-      if (Array.isArray(wr.plan) && wr.plan.length) out.push(`Suggested next 7 days (rule-based): ${wr.plan.map((x) => `${x.weekday} ${x.type} ${r1(x.lo, 1)}–${r1(x.hi, 1)}`).join("; ")}.`);
+      if (wr.load) out.push(`Training load (Banister model): fitness CTL ${r1(wr.load.ctl, 1)}, fatigue ATL ${r1(wr.load.atl, 1)}, form TSB ${r1(wr.load.tsb, 1)}, acute:chronic ratio ${r1(wr.load.acwr, 2)} (${wr.load.status}), week strain total ${r1(wr.load.totalStrain, 1)} (raw 0–21 units, internal).`);
+      if (Array.isArray(wr.plan) && wr.plan.length) out.push(`Suggested next 7 days (rule-based, strain as % of today's target): ${wr.plan.map((x) => `${x.weekday} ${x.type} ${r1(sPct(x.lo, derived[last]))}–${r1(sPct(x.hi, derived[last]))}%`).join("; ")}.`);
       if (Array.isArray(wr.actions) && wr.actions.length) out.push(`Rule-based actions: ${wr.actions.map((x) => (typeof x === "string" ? x : x && (x.text || x.title)) || "").filter(Boolean).join(" | ")}`);
     }
     const dr = tryRun("drivers", [days, derived]);
@@ -15045,7 +15099,7 @@ Rules: be concise (under ~180 words unless they ask for a plan or review). Use o
     resprate: ["Respiratory rate", "/min", 1, "lower"],
     spo2: ["Blood oxygen", "%", 1, "higher"],
     recovery: ["Recovery", "%", 0, "higher"],
-    strain: ["Strain", "", 1, null],
+    strain: ["Strain", "%", 0, null],
     sleep: ["Sleep", "", 0, "higher"],
     sleepperformance: ["Sleep performance", "%", 0, "higher"],
     asleep: ["Time asleep", "min", 0, "higher"],
@@ -15473,6 +15527,8 @@ Rules: be concise (under ~180 words unless they ask for a plan or review). Use o
     const list = stateOf(r) === "ok" ? arr(r, "days", "plan", "items") : [];
     if (!list.length) return card("Next 7 days", "", wait("No plan yet", stateOf(r) === "ok" ? { status: "not_enough_data" } : r, { min: 21, have: haveDays(ctx, ctx.i), why: "The plan keeps your load ratio between 0.8 and 1.3, so it needs 3 weeks of load history." }));
     const base = ctx.days[ctx.i] ? ctx.days[ctx.i].date : null;
+    // strain on screen = % of the top of today's target (App.strainPct); the bar runs 0–150 %
+    const sp = (v) => (isNum(v) ? (App.strainPct ? App.strainPct(v, ctx.d) : (v / 14) * 100) : null);
     const rows = list.slice(0, 7).map((p, k) => {
       const date = pick(p, "date", "day") || (base && ctx.E && ctx.E.addDays ? ctx.E.addDays(base, k + 1) : "");
       const rng = Array.isArray(p.strain) ? p.strain : Array.isArray(p.range) ? p.range : Array.isArray(p.target) ? p.target : null;
@@ -15483,12 +15539,13 @@ Rules: be concise (under ~180 words unless they ask for a plan or review). Use o
       const mid = isNum(lo) && isNum(hi) ? (lo + hi) / 2 : null;
       const cls = /rest|recover|easy/i.test(kind) || (isNum(mid) && mid < 9) ? "neutral" : isNum(mid) && mid >= 15 ? "bad" : "strain";
       const d = typeof date === "string" && /^\d{4}-\d{2}-\d{2}/.test(date) ? F().day(date).split(" ") : [String(date), ""];
-      const bar = isNum(lo) && isNum(hi) ? `<span class="in-pd-bar" aria-hidden="true"><i style="left:${((Math.max(0, lo) / 21) * 100).toFixed(1)}%;width:${Math.max(3, ((Math.min(21, hi) - Math.max(0, lo)) / 21) * 100).toFixed(1)}%"></i></span>` : "";
+      const pl = sp(lo), ph = sp(hi);
+      const bar = isNum(lo) && isNum(hi) ? `<span class="in-pd-bar" aria-hidden="true"><i style="left:${((Math.min(150, Math.max(0, pl)) / 150) * 100).toFixed(1)}%;width:${Math.max(3, ((Math.min(150, ph) - Math.min(150, Math.max(0, pl))) / 150) * 100).toFixed(1)}%"></i></span>` : "";
       return `<div class="tile in-pd in-pd-${cls}"><div class="in-pd-h"><strong>${esc(d[0])}</strong> <span class="muted num">${esc(d.slice(1).join(" "))}</span></div>` +
-        `<div class="in-pd-v num">${isNum(lo) && isNum(hi) ? `${F().strain(lo)}<span class="in-pd-dash">–</span>${F().strain(hi)}` : DASH}</div>${bar}` +
+        `<div class="in-pd-v num">${isNum(lo) && isNum(hi) ? `${Math.round(pl)}<span class="in-pd-dash">–</span>${Math.round(ph)}%` : DASH}</div>${bar}` +
         (why ? `<div class="muted small in-pd-w">${esc(why)}</div>` : "") + `</div>`;
     }).join("");
-    return `<div class="card span-2">${head("Next 7 days", "strain range, 0–21")}<div class="in-plan">${rows}</div>` +
+    return `<div class="card span-2">${head("Next 7 days", "strain, % of today's target")}<div class="in-plan">${rows}</div>` +
       `<p class="muted small">Ranges keep your load ratio in the sweet spot. Follow your morning recovery when it disagrees.</p></div>`;
   }
 
@@ -15514,6 +15571,8 @@ Rules: be concise (under ~180 words unless they ask for a plan or review). Use o
   }
 
   /* normalise a scenario result to {rows:[bedtimeMin], cols:[{label, strain}], cell(r,c) → recovery} */
+  let spCtx = null; // the day the scenario is for (set by scenarioCard): strain % is relative to its target
+  const spS = (v) => (isNum(v) ? `${Math.round(App.strainPct ? App.strainPct(v, spCtx) : (v / 14) * 100)}%` : DASH);
   function normScenario(s) {
     if (!s || typeof s !== "object") return null;
     const strainLabel = (v, k) => (typeof v === "string" ? v : isNum(v) ? (k === 0 ? "Low" : k === 1 ? "Medium" : k === 2 ? "High" : "") : pick(v, "label", "name") || "");
@@ -15528,7 +15587,7 @@ Rules: be concise (under ~180 words unless they ask for a plan or review). Use o
         const key = typeof sv === "object" ? JSON.stringify(sv) : String(sv);
         if (!isNum(b)) continue;
         if (!rowsK.includes(b)) rowsK.push(b);
-        if (!colsK.some((x) => x.key === key)) colsK.push({ key, label: typeof sv === "string" ? sv : isNum(c.strain) ? `Strain ${F().strain(c.strain)}` : strainLabel(sv, colsK.length), strain: isNum(c.strain) ? c.strain : null });
+        if (!colsK.some((x) => x.key === key)) colsK.push({ key, label: typeof sv === "string" ? sv : isNum(c.strain) ? `Strain ${spS(c.strain)}` : strainLabel(sv, colsK.length), strain: isNum(c.strain) ? c.strain : null });
         map.set(b + "|" + key, recOf(c));
       }
       if (!rowsK.length || !colsK.length) return null;
@@ -15556,6 +15615,7 @@ Rules: be concise (under ~180 words unless they ask for a plan or review). Use o
 
   function scenarioCard(ctx) {
     const r = call(ctx, "sc" + ctx.i, "scenario", [ctx.days, ctx.derived, ctx.i]);
+    spCtx = ctx.d;
     const g = stateOf(r) === "ok" ? normScenario(r) : null;
     if (!g) return card("If you…", "", wait("What-if grid not ready", stateOf(r) === "ok" ? { status: "not_enough_data" } : r, { min: 29, have: haveDays(ctx, ctx.i), why: "The grid uses the same forecast model, which needs at least 28 paired days." }), "span-2");
     let best = null;
@@ -15570,7 +15630,7 @@ Rules: be concise (under ~180 words unless they ask for a plan or review). Use o
       }).join("") + `</tr>`).join("");
     return `<div class="card span-2">${head("If you…", "tomorrow's recovery")}` +
       `<p class="muted small">Rows are tonight's bedtime, columns are how hard you go today. Each cell is the forecast recovery for tomorrow morning.</p>` +
-      `<table class="in-grid"><thead><tr><th scope="col">Bed</th>${g.cols.map((c) => `<th scope="col">${esc(c.label)}${isNum(c.strain) && !/\d/.test(c.label) ? `<span class="num muted"> ${F().strain(c.strain)}</span>` : ""}</th>`).join("")}</tr></thead><tbody>${cells}</tbody></table>` +
+      `<table class="in-grid"><thead><tr><th scope="col">Bed</th>${g.cols.map((c) => `<th scope="col">${esc(c.label)}${isNum(c.strain) && !/\d/.test(c.label) ? `<span class="num muted"> ${spS(c.strain)}</span>` : ""}</th>`).join("")}</tr></thead><tbody>${cells}</tbody></table>` +
       `<div class="legend"><span class="key" style="--c:var(--green)">67–100%</span><span class="key" style="--c:var(--yellow)">34–66%</span><span class="key" style="--c:var(--red)">0–33%</span><span class="key" style="--c:var(--ink)">best option outlined</span></div></div>`;
   }
 
@@ -16263,7 +16323,7 @@ Rules: be concise (under ~180 words unless they ask for a plan or review). Use o
     return { start: `${y}-${pad(m)}-01`, end: uymd(new Date(Date.UTC(y, m, 0))) };
   }
   const periodOf = (day, kind) => (kind === "week" ? isoWeek(day) : day.slice(0, 7));
-  const REPORT_METRICS = ["recovery", "strain", "sleepPerf", "sleepHours", "hrv", "rhr"];
+  const REPORT_METRICS = ["recovery", "strain", "strainPct", "sleepPerf", "sleepHours", "hrv", "rhr"];
   const acwrBand = (r) => (r < 0.8 ? "LOAD_RAMPING_DOWN" : r < 1.3 ? "LOAD_SWEET_SPOT" : r < 1.5 ? "LOAD_BUILDING_FAST" : "LOAD_SPIKING");
   const BALANCE = {
     LOAD_SWEET_SPOT: { word: "Balanced", line: "Your strain matched your recovery most days.", c: "good" },
@@ -16288,6 +16348,8 @@ Rules: be concise (under ~180 words unless they ask for a plan or review). Use o
         day: day.date,
         recovery: isNum(d.recovery) ? d.recovery : null,
         strain: isNum(d.strain) ? d.strain : null,
+        // on screen strain is % of the top of that day's target (App.strainPct)
+        strainPct: isNum(d.strain) && App.strainPct ? App.strainPct(d.strain, d) : null,
         sleepPerf: isNum(d.sleepPerformance) ? d.sleepPerformance : null,
         sleepHours: isNum(asleep) ? asleep / 60 : null,
         hrv: isNum(day.hrv) ? day.hrv : null,
@@ -16415,7 +16477,7 @@ Rules: be concise (under ~180 words unless they ask for a plan or review). Use o
       const dials = `<div class="pv-rp-dials">
         ${dial("Avg sleep", a.sleepPerf, 100, "var(--sleep)", `${Math.round(a.sleepPerf)}%`, dl.sleepPerf, 0)}
         ${dial("Avg recovery", a.recovery, 100, isNum(a.recovery) ? App.recColor(a.recovery) : "var(--muted)", `${Math.round(a.recovery)}%`, dl.recovery, 0)}
-        ${dial("Avg strain", a.strain, 21, "var(--strain)", d1(a.strain), dl.strain, 1)}
+        ${dial("Avg strain", a.strainPct, 100, "var(--strain)", isNum(a.strainPct) ? `${Math.round(a.strainPct)}%` : DASH, dl.strainPct, 0)}
       </div><p class="muted small">Change vs the ${kind} before.</p>`;
 
       let inT = 0, withT = 0;
@@ -16439,7 +16501,7 @@ Rules: be concise (under ~180 words unless they ask for a plan or review). Use o
       };
       const avgList = `<div class="list">
         ${statRow("Recovery", a.recovery, pa.recovery, (v) => `${Math.round(v)}%`, "up")}
-        ${statRow("Day strain", a.strain, pa.strain, (v) => v.toFixed(1), "neutral")}
+        ${statRow("Day strain (% of target)", a.strainPct, pa.strainPct, (v) => `${Math.round(v)}%`, "neutral")}
         ${statRow("Sleep performance", a.sleepPerf, pa.sleepPerf, (v) => `${Math.round(v)}%`, "up")}
         ${statRow("Hours of sleep", a.sleepHours, pa.sleepHours, (v) => hm(v * 60), "up")}
         ${statRow("Sleep consistency", r.sleepConsistency, r.prevConsistency, (v) => `${Math.round(v)}%`, "up")}
@@ -16459,7 +16521,7 @@ Rules: be concise (under ~180 words unless they ask for a plan or review). Use o
 
       const strainOn = (day) => {
         const x = r.cur.find((row) => row.day === day);
-        return x && isNum(x.strain) ? x.strain.toFixed(1) : DASH;
+        return x && isNum(x.strainPct) ? `${Math.round(x.strainPct)}%` : DASH;
       };
       const bw = r.best && r.worst && scored >= 2
         ? `<div class="list">${[["Best day", r.best], ["Worst day", r.worst]].map(([l, x]) => `<div class="row"><div class="pv-row-t"><strong>${l}</strong><span class="muted small">${esc(F().day(x.day))}</span></div><span class="num"><span style="color:${App.recColor(x.recovery)}">${Math.round(x.recovery)}%</span> <span class="muted small">· strain ${strainOn(x.day)}</span></span></div>`).join("")}</div>`
