@@ -10477,7 +10477,7 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
   "use strict";
   const E = root.CadenceEngine;
   const Views = (root.Views = root.Views || {});
-  const ORDER = ["overview", "sleep", "recovery", "strain", "performance", "health", "cycle", "calories", "insights", "journal", "trends", "coach",
+  const ORDER = ["overview", "sleep", "recovery", "strain", "performance", "health", "cycle", "calories", "insights", "journal", "trends", "coach", "settings",
     /* v1 view keys, still shown if a file registers them */ "today", "activity", "fuel", "data"];
   const DEFAULT_DOB = "2001-02-09";
   const DEFAULT_VIEW = "overview";
@@ -11586,6 +11586,7 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
     more: '<circle cx="5.5" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="18.5" cy="12" r="1.3"/>',
     cycle: '<path d="M12 3.2c3.3 4.1 5.6 7.3 5.6 10.4a5.6 5.6 0 0 1-11.2 0C6.4 10.5 8.7 7.3 12 3.2z"/><path d="M9.6 14.2a2.6 2.6 0 0 0 2.4 2.5"/>',
     calories: '<path d="M12 21.5c-3.9 0-6.5-2.6-6.5-6.1 0-3.7 2.9-5.7 3.9-9.4.2-.7 1-.9 1.4-.3 1 1.5 1.3 3 1.2 4.4 1.2-.6 2-1.8 2.3-3 .2-.6 1-.8 1.4-.2 1.6 2.3 2.8 4.6 2.8 7.9 0 4-2.6 6.7-6.5 6.7z"/>',
+    settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/>',
     prev: '<path d="M15 5l-7 7 7 7"/>',
     next: '<path d="M9 5l7 7-7 7"/>',
   };
@@ -11699,7 +11700,24 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
       document.head.appendChild(st);
     }
   }
-  const isView = (k) => !!(k && Object.prototype.hasOwnProperty.call(Views, k) && Views[k] && typeof Views[k].render === "function");
+  /* optional features, switched on in Settings (kept per device, like the theme) */
+  const FEAT_LS = "cadence.features";
+  const FEAT_DEFAULTS = { cycle: false };
+  function featGet(k) {
+    let o = {};
+    try { o = JSON.parse((lsOk && root.localStorage.getItem(FEAT_LS)) || "{}") || {}; } catch (e) {}
+    return k in o ? !!o[k] : !!FEAT_DEFAULTS[k];
+  }
+  function featSet(k, v) {
+    let o = {};
+    try { o = JSON.parse((lsOk && root.localStorage.getItem(FEAT_LS)) || "{}") || {}; } catch (e) {}
+    o[k] = !!v;
+    try { if (lsOk) root.localStorage.setItem(FEAT_LS, JSON.stringify(o)); } catch (e) {}
+    if (k === "cycle" && !v && S.view === "cycle") go("settings");
+    else rerender();
+  }
+  const featureOff = (k) => k === "cycle" && !featGet("cycle");
+  const isView = (k) => !!(k && Object.prototype.hasOwnProperty.call(Views, k) && Views[k] && typeof Views[k].render === "function" && !featureOff(k));
   /* the AI coach is optional (CONTRACT-v3): listed only with an API key on the website,
      or inside Claude when the sample capability answers */
   function coachOn() {
@@ -11738,6 +11756,7 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
     ]],
     ["App", [
       [["data"], "Import, sync and export"],
+      [["settings"], "Theme and features"],
       [["about"], "About Cadence"],
     ]],
   ];
@@ -12658,6 +12677,7 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
     docGet,
     docSet,
     theme: { get: themeGet, set: themeSet, list: () => THEMES.map((t) => ({ ...t, sw: t.sw.slice() })) },
+    features: { get: featGet, set: featSet },
     todayStr,
     strainRef,
     strainPct,
@@ -13226,6 +13246,7 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
   /* small cycle card from the Cycle tab (hidden in discreet mode or before any period is logged) */
   const cycleCard = (ctx) => {
     try {
+      if (App.features && !App.features.get("cycle")) return "";
       return window.CadenceCycleUI && typeof window.CadenceCycleUI.homeCard === "function" ? window.CadenceCycleUI.homeCard(ctx) || "" : "";
     } catch (e) {
       return "";
@@ -18674,11 +18695,6 @@ Rules: be concise (under ~180 words unless they ask for a plan or review). Use o
     const cs = s.customSymptoms || [];
     const custom = `<div class="card">${head("Your symptoms", cs.length ? String(cs.length) : "")}${cs.length ? `<div class="cy-chips">${cs.map((c) => `<button type="button" class="cy-tg on cy-rmv" style="--pc:var(--accent)" data-action="cy-sym-rm" data-v="${esc(c.key)}" aria-label="Remove ${esc(c.label)}">${esc(c.label)} ${ic("x", 13)}</button>`).join("")}</div>` : `<p class="muted cy-p">Add things you want to track that aren't in the list.</p>`}
       <form class="cy-add" data-submit="cy-sym-add"><input class="input" name="label" maxlength="30" placeholder="e.g. Migraine" aria-label="New symptom"><button class="btn small" type="submit">${ic("plus", 16)}Add</button></form></div>`;
-    const th = App.theme.get();
-    const themes = `<div class="card">${head("Theme", "whole app")}<div class="cy-themes">${App.theme
-      .list()
-      .map((t) => `<button type="button" class="cy-theme${th === t.key ? " on" : ""}" data-action="cy-theme" data-v="${esc(t.key)}" aria-pressed="${th === t.key}"><span class="cy-sw" style="background:${esc(t.sw[0])}"><i style="background:${esc(t.sw[1])}"></i><i style="background:${esc(t.sw[2] || t.sw[1])}"></i></span><b>${esc(t.name)}</b><span>${esc(t.sub)}</span></button>`)
-      .join("")}</div></div>`;
     const tg = (k, on, t, d) => `<button type="button" class="cy-sw-row" role="switch" aria-checked="${!!on}" data-action="cy-toggle" data-k="${k}"><span><b>${t}</b><small>${d}</small></span><i class="cy-switch${on ? " on" : ""}"></i></button>`;
     const lockOn = !!s.lock;
     const privacy = `<div class="card">${head(`${ic("lock", 15)} Privacy`)}
@@ -18695,7 +18711,8 @@ Rules: be concise (under ~180 words unless they ask for a plan or review). Use o
       <div class="cy-btns"><button class="btn" type="submit">${ic("cal", 16)}Calendar (.ics)</button><button type="button" class="btn" data-action="cy-csv">Spreadsheet (.csv)</button></div></form>
       <p class="cy-note">The calendar file adds the next 6 predicted periods with an alert the day before. Import it into your phone's calendar; export again when predictions change.</p></div>`;
     const wipe = `<div class="card">${head("Delete")}<p class="cy-p">Removes every period, log, pill, timer and setting in this tab. This can't be undone.</p><div>${confirmBtn("wipe", "Delete all cycle data", "Tap again — this deletes everything", "danger")}</div></div>`;
-    return goals + lengths + custom + themes + privacy + exp + wipe;
+    // the theme picker lives in the app's Settings page now (More → Settings)
+    return goals + lengths + custom + privacy + exp + wipe;
   }
 
   /* ================================================================= ONBOARDING + LOCK */
@@ -20151,6 +20168,82 @@ html[data-theme="blush"] .cy-pc.taken{color:#fff}
       App.rerender();
     });
   }
+})();
+</script>
+<script>/* Cadence — Settings: app theme and optional features (More → Settings). */
+(function () {
+  "use strict";
+  const Views = (window.Views = window.Views || {});
+  const esc = (s) => App.esc(s == null ? "" : String(s));
+
+  function switchRow(key, on, title, desc) {
+    return `<button type="button" class="st-row" role="switch" aria-checked="${on}" data-action="st-feature" data-k="${key}">` +
+      `<span class="st-row-t"><b>${esc(title)}</b><small>${esc(desc)}</small></span><i class="st-switch${on ? " on" : ""}" aria-hidden="true"></i></button>`;
+  }
+
+  Views.settings = {
+    label: "Settings",
+    icon: "settings",
+    dated: false,
+    render() {
+      const cur = App.theme.get();
+      const themes = App.theme.list().map((t) =>
+        `<button type="button" class="st-theme${cur === t.key ? " on" : ""}" data-action="st-theme" data-v="${esc(t.key)}" aria-pressed="${cur === t.key}">` +
+        `<span class="st-sw" style="background:${esc(t.sw[0])}"><i style="background:${esc(t.sw[1])}"></i><i style="background:${esc(t.sw[2] || t.sw[1])}"></i></span>` +
+        `<b>${esc(t.name)}</b><span>${esc(t.sub)}</span></button>`).join("");
+      const cycleOn = App.features.get("cycle");
+      return `<div class="page one-col v-settings">
+        <section class="card st-card"><div class="card-head"><h2>Theme</h2><span class="card-meta">Whole app</span></div>
+          <div class="st-themes">${themes}</div>
+          <p class="muted st-note">The theme is saved on this device.</p>
+        </section>
+        <section class="card st-card"><div class="card-head"><h2>Features</h2></div>
+          ${switchRow("cycle", cycleOn, "Cycle tracking", cycleOn ? "On: the Cycle tab is in the bottom bar." : "Turn on to add a Cycle tab for periods, symptoms, predictions and birth control.")}
+          ${cycleOn ? `<a class="st-link" href="#cycle">Open Cycle<span aria-hidden="true">›</span></a>` : ""}
+          <p class="muted st-note">Turning it off only hides the tab. Anything you logged stays saved on this device.</p>
+        </section>
+        <section class="card st-card"><div class="card-head"><h2>More settings</h2></div>
+          <a class="st-link" href="#data">Data, sync and profile<span aria-hidden="true">›</span></a>
+          <a class="st-link" href="#coach">AI coach key<span aria-hidden="true">›</span></a>
+          <a class="st-link" href="#about">About Cadence<span aria-hidden="true">›</span></a>
+        </section>
+      </div>`;
+    },
+    css: `
+.v-settings{max-width:720px;margin-inline:auto}
+.st-card{display:flex;flex-direction:column;gap:12px}
+.st-themes{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.st-theme{display:flex;flex-direction:column;gap:3px;padding:10px;border:0;border-radius:14px;background:var(--inset);color:var(--foreground);font:inherit;text-align:left;cursor:pointer;box-shadow:inset 0 0 0 1px var(--border);min-height:44px}
+.st-theme.on{box-shadow:inset 0 0 0 2px var(--accent)}
+.st-theme b{font-size:14.5px;margin-top:6px}
+.st-theme > span:last-child{font-size:12px;color:var(--muted)}
+.st-sw{position:relative;display:flex;align-items:flex-end;justify-content:flex-end;gap:5px;height:52px;border-radius:10px;padding:8px;box-shadow:inset 0 0 0 1px rgba(128,128,128,.25)}
+.st-sw i{width:18px;height:18px;border-radius:50%}
+.st-row{display:flex;align-items:center;justify-content:space-between;gap:14px;width:100%;padding:8px 0;border:0;background:none;color:var(--foreground);font:inherit;text-align:left;cursor:pointer;min-height:56px}
+.st-row-t b{display:block;font-size:15px;font-weight:600}
+.st-row-t small{display:block;font-size:12.5px;line-height:17px;color:var(--muted);margin-top:2px}
+.st-switch{position:relative;flex:none;width:48px;height:28px;border-radius:14px;background:var(--dial-track);transition:background .2s}
+.st-switch::after{content:"";position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:var(--foreground);transition:transform .25s cubic-bezier(.16,1,.3,1)}
+.st-switch.on{background:var(--accent)}
+.st-switch.on::after{transform:translateX(20px);background:var(--accent-ink,#101518)}
+.st-link{display:flex;align-items:center;justify-content:space-between;min-height:48px;padding:0 2px;border-top:1px solid var(--border);color:var(--foreground);text-decoration:none;font-weight:600}
+.st-link span{color:var(--muted);font-size:20px}
+.st-note{margin:0;font-size:12.5px}
+@media (prefers-reduced-motion: reduce){.st-switch,.st-switch::after{transition:none}}
+`,
+  };
+
+  App.on("st-theme", (el) => {
+    App.theme.set(el.dataset.v);
+    const t = App.theme.list().find((x) => x.key === el.dataset.v);
+    if (t) App.toast(`${t.name} theme on`);
+  });
+  App.on("st-feature", (el) => {
+    const k = el.dataset.k;
+    const next = !App.features.get(k);
+    App.features.set(k, next);
+    if (k === "cycle") App.toast(next ? "Cycle tab turned on" : "Cycle tab hidden");
+  });
 })();
 </script>
 <script>/* Cadence view: Data (source status, import, phone app, profile, backup). */
