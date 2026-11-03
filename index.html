@@ -7991,8 +7991,19 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
     return vals;
   }
 
+  /* Sensitivity (CONTRACT-V8): "normal" is the default and keeps the thresholds above exactly; "sensitive" lowers the
+   * z threshold to 0.75 × WARN.z, the skin-temperature rise to 0.3 °C and the SpO2 drop to 1.5 points. The level rules
+   * (watch / alert) are the same for both. */
+  const SENS = { zMul: 0.75, tempDelta: 0.3, spo2Drop: 1.5 };
+  const sensOf = (opts) => (opts && opts.sensitivity === "sensitive" ? "sensitive" : "normal");
+  // read WARN live so "normal" always matches the constants exactly
+  const thrOf = (opts) => (sensOf(opts) === "sensitive"
+    ? { z: WARN.z * SENS.zMul, tempDelta: SENS.tempDelta, spo2Drop: SENS.spo2Drop }
+    : { z: WARN.z, tempDelta: WARN.tempDelta, spo2Drop: WARN.spo2Drop });
+
   /* signals for one day: { signals, evaluated } (evaluated = metrics that had a value and a baseline) */
-  function warningSignalsAt(days, i) {
+  function warningSignalsAt(days, i, opts) {
+    const TH = thrOf(opts);
     const d = days[i];
     const signals = [];
     let evaluated = 0;
@@ -8005,7 +8016,7 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
       if (b && b.n >= WARN.minBase && isNum(d.restingHr)) {
         evaluated++;
         const zz = z(d.restingHr, b);
-        if (zz >= WARN.z) signals.push({ metric: "rhr", label: WARN_LABEL.rhr, value: r1(d.restingHr), baseline: r1(b.median), z: r2(zz), direction: "up",
+        if (zz >= TH.z) signals.push({ metric: "rhr", label: WARN_LABEL.rhr, value: r1(d.restingHr), baseline: r1(b.median), z: r2(zz), direction: "up",
           reason: `Resting heart rate ${fmt(d.restingHr)} bpm is ${fmt(d.restingHr - b.median, 1)} bpm above your usual ${fmt(b.median, 1)}.` });
       }
     }
@@ -8016,7 +8027,7 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
       if (b && b.n >= WARN.minBase && isNum(x)) {
         evaluated++;
         const zz = z(x, b);
-        if (zz <= -WARN.z) {
+        if (zz <= -TH.z) {
           const pct = (1 - Math.exp(x - b.median)) * 100;
           signals.push({ metric: "hrv", label: WARN_LABEL.hrv, value: r1(d.hrv), baseline: r1(Math.exp(b.median)), z: r2(zz), direction: "down",
             reason: `HRV ${fmt(d.hrv)} ms is ${fmt(pct)} % below your usual ${fmt(Math.exp(b.median))} ms.` });
@@ -8029,7 +8040,7 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
       if (b && b.n >= WARN.minBase && isNum(d.respRate)) {
         evaluated++;
         const zz = z(d.respRate, b);
-        if (zz >= WARN.z) signals.push({ metric: "resp", label: WARN_LABEL.resp, value: r1(d.respRate), baseline: r1(b.median), z: r2(zz), direction: "up",
+        if (zz >= TH.z) signals.push({ metric: "resp", label: WARN_LABEL.resp, value: r1(d.respRate), baseline: r1(b.median), z: r2(zz), direction: "up",
           reason: `Breathing rate ${fmt(d.respRate, 1)} /min is ${fmt(d.respRate - b.median, 1)} above your usual ${fmt(b.median, 1)}.` });
       }
     }
@@ -8039,7 +8050,7 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
       if (b && b.n >= WARN.minBase && isNum(d.skinTempDev)) {
         evaluated++;
         const delta = d.skinTempDev - b.median;
-        if (delta >= WARN.tempDelta - 1e-9) signals.push({ metric: "temp", label: WARN_LABEL.temp, value: r2(d.skinTempDev), baseline: r2(b.median), z: r2(delta / b.scale), direction: "up",
+        if (delta >= TH.tempDelta - 1e-9) signals.push({ metric: "temp", label: WARN_LABEL.temp, value: r2(d.skinTempDev), baseline: r2(b.median), z: r2(delta / b.scale), direction: "up",
           reason: `Skin temperature is ${fmt(delta, 1)} °C above your usual.` });
       }
     }
@@ -8050,7 +8061,7 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
         evaluated++;
         const low = d.spo2 < WARN.spo2Abs;
         const drop = b && b.n >= WARN.minBase ? b.median - d.spo2 : null;
-        if (low || (isNum(drop) && drop >= WARN.spo2Drop - 1e-9)) {
+        if (low || (isNum(drop) && drop >= TH.spo2Drop - 1e-9)) {
           signals.push({ metric: "spo2", label: WARN_LABEL.spo2, value: r1(d.spo2), baseline: b ? r1(b.median) : null, z: b ? r2((d.spo2 - b.median) / b.scale) : null, direction: "down",
             reason: low ? `Blood oxygen ${fmt(d.spo2, 1)} % is below 94 %.` : `Blood oxygen ${fmt(d.spo2, 1)} % is ${fmt(drop, 1)} points below your usual ${fmt(b.median, 1)} %.` });
         }
@@ -8059,24 +8070,101 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
     return { signals, evaluated };
   }
 
+  /* Robust baseline for one metric on day i, in display units, with the "normal band" that matches the warning
+   * thresholds: values outside [lo, hi] on the warning side count as a signal.
+   * warningBaseline(days, i, metric, opts) → { metric, median, lo, hi, n, ready, unit } or null (metric unknown / no values) */
+  const BASE_GET = {
+    rhr: (x) => x.restingHr,
+    hrv: (x) => (isNum(x && x.hrv) && x.hrv > 0 ? Math.log(x.hrv) : null),
+    resp: (x) => x.respRate,
+    temp: (x) => x.skinTempDev,
+    spo2: (x) => x.spo2,
+  };
+  const BASE_FLOOR = { rhr: "rhr", hrv: "lnHrv", resp: "resp", temp: "temp", spo2: "spo2" };
+  const BASE_UNIT = { rhr: "bpm", hrv: "ms", resp: "/min", temp: "°C", spo2: "%" };
+  function warningBaseline(days, i, metric, opts) {
+    if (!Array.isArray(days) || !days.length || !BASE_GET[metric]) return null;
+    if (!isNum(i)) i = days.length - 1;
+    i = Math.round(i);
+    if (i < 0 || i >= days.length || !days[i] || !days[i].date) return null;
+    const TH = thrOf(opts);
+    const b = robust(baseWindow(days, i, BASE_GET[metric]), WARN.floors[BASE_FLOOR[metric]]);
+    if (!b) return null;
+    let median = b.median, lo, hi;
+    if (metric === "hrv") { median = Math.exp(b.median); lo = Math.exp(b.median - TH.z * b.scale); hi = Math.exp(b.median + TH.z * b.scale); }
+    else if (metric === "temp") { lo = b.median - TH.tempDelta; hi = b.median + TH.tempDelta; }
+    else if (metric === "spo2") { lo = Math.max(b.median - TH.spo2Drop, WARN.spo2Abs); hi = Math.min(100, b.median + TH.spo2Drop); }
+    else { lo = b.median - TH.z * b.scale; hi = b.median + TH.z * b.scale; }
+    const dp = metric === "temp" ? 2 : 1;
+    const rr = (v) => (dp === 2 ? r2(v) : r1(v));
+    return { metric, median: rr(median), lo: rr(lo), hi: rr(Math.max(hi, lo)), n: b.n, ready: b.n >= WARN.minBase, unit: BASE_UNIT[metric] };
+  }
+
+  /* Heads-up: a gentle trend that hasn't crossed a threshold. 2+ consecutive days with resting HR rising day-on-day
+   * and above its baseline median, or HRV falling day-on-day and below its baseline median.
+   * headsUpAt(days, i) → { metric, days, text, values } or null */
+  // whole numbers, or one decimal when rounding would make two steps of a strictly moving run look equal
+  const roundSeq = (vals, f) => {
+    const w = vals.map((x) => Math.round(f(x)));
+    return w.some((x, k) => k && x === w[k - 1]) ? vals.map((x) => r1(f(x))) : w;
+  };
+  function headsUpAt(days, i) {
+    if (!Array.isArray(days) || !days[i]) return null;
+    const consec = (k) => k - 1 >= 0 && days[k - 1] && dayDiff(days[k - 1].date, days[k].date) === 1;
+    const one = (metric, get, dir) => {
+      const b = robust(baseWindow(days, i, get), metric === "rhr" ? WARN.floors.rhr : WARN.floors.lnHrv);
+      if (!b || b.n < WARN.minBase) return null;
+      const med = b.median;
+      let run = 0, k = i;
+      while (consec(k) && run < 14) {
+        const a = get(days[k - 1]), c = get(days[k]);
+        if (!isNum(a) || !isNum(c)) break;
+        const moved = dir > 0 ? c > a : c < a;
+        const off = dir > 0 ? c > med : c < med;
+        if (!moved || !off) break;
+        run++;
+        k--;
+      }
+      if (run < 2) return null;
+      const vals = [];
+      for (let q = k; q <= i; q++) vals.push(get(days[q]));
+      return { run, vals, med };
+    };
+    const r = one("rhr", (x) => x.restingHr, 1);
+    const h = one("hrv", (x) => (isNum(x && x.hrv) && x.hrv > 0 ? Math.log(x.hrv) : null), -1);
+    if (!r && !h) return null;
+    if (r && (!h || r.run >= h.run)) {
+      const v = roundSeq(r.vals, (x) => x);
+      return { metric: "rhr", days: r.run, values: v,
+        text: `Resting heart rate has gone up ${r.run} days in a row (${v.join(" → ")} bpm) and is above your usual ${fmt(r.med)}.` };
+    }
+    const v = roundSeq(h.vals, (x) => Math.exp(x));
+    return { metric: "hrv", days: h.run, values: v,
+      text: `HRV has gone down ${h.run} days in a row (${v.join(" → ")} ms) and is below your usual ${fmt(Math.exp(h.med))}.` };
+  }
+
   /**
-   * warning(days, derived, i) → { date, level: "none"|"watch"|"alert", score, signals, since, reasons, ready, message }
+   * warning(days, derived, i, opts) → { date, level: "none"|"watch"|"alert", score, signals, since, reasons, ready, message,
+   *   consecutiveDays, evaluated, sensitivity, headsUp }
+   * opts.sensitivity: "normal" (default; thresholds above) | "sensitive" (lower thresholds, see SENS).
+   * headsUp: see headsUpAt (null when there is none; may be set at any level).
    * level: "alert" when ≥ 3 signals today, or ≥ 2 signals today and yesterday;
    *        "watch" when ≥ 2 signals today, or ≥ 1 signal today and yesterday; else "none".
    * score: weighted count of today's signals (RHR, HRV, temperature 1.0; breathing, SpO2 0.75).
    * since: first day of the current unbroken run of days with ≥ 1 signal (null when level is "none").
    */
-  function warning(days, derived, i) {
-    const empty = (msg, date) => ({ date: date || null, level: "none", score: 0, signals: [], since: null, reasons: [], ready: false, message: msg, consecutiveDays: 0 });
+  function warning(days, derived, i, opts) {
+    const sens = sensOf(opts);
+    const empty = (msg, date) => ({ date: date || null, level: "none", score: 0, signals: [], since: null, reasons: [], ready: false, message: msg, consecutiveDays: 0, sensitivity: sens, headsUp: null });
     if (!Array.isArray(days) || !days.length) return empty("Not enough data yet: the early warning needs about 2 weeks of nights.");
     if (!isNum(i)) i = days.length - 1;
     i = Math.round(i);
     if (i < 0 || i >= days.length || !days[i]) return empty("Not enough data yet: the early warning needs about 2 weeks of nights.");
-    const today = warningSignalsAt(days, i);
+    const today = warningSignalsAt(days, i, opts);
     if (!today.evaluated) return empty("Not enough data yet: the early warning needs about 2 weeks of nights with heart-rate and HRV readings.", days[i].date);
 
     const consec = (k) => k - 1 >= 0 && dayDiff(days[k - 1].date, days[k].date) === 1;
-    const yest = consec(i) ? warningSignalsAt(days, i - 1) : { signals: [], evaluated: 0 };
+    const yest = consec(i) ? warningSignalsAt(days, i - 1, opts) : { signals: [], evaluated: 0 };
     const c0 = today.signals.length, c1 = yest.signals.length;
     let level = "none";
     if (c0 >= 3 || (c0 >= 2 && c1 >= 2)) level = "alert";
@@ -8090,7 +8178,7 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
       since = days[i].date;
       run = 1;
       while (run < 21 && consec(k)) {
-        const s = k - 1 === i - 1 ? yest : warningSignalsAt(days, k - 1);
+        const s = k - 1 === i - 1 ? yest : warningSignalsAt(days, k - 1, opts);
         if (!s.signals.length) break;
         k--;
         since = days[k].date;
@@ -8103,7 +8191,8 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
     if (level === "alert") message = "Several of your body signals are off your normal at once. This pattern often comes before a cold or other illness, or follows heavy training, alcohol or poor sleep. Consider an easy day and extra sleep. If you feel unwell, talk to a doctor.";
     else if (level === "watch") message = "Some body signals are off your normal. Worth keeping today easy and watching tomorrow's numbers.";
     else message = c0 === 1 ? "One signal is off your normal today. A single change is common and usually not a concern." : "Your body signals are within your normal range.";
-    return { date: days[i].date, level, score, signals: today.signals, since: level === "none" ? null : since, reasons, ready: true, message, consecutiveDays: level === "none" ? 0 : run, evaluated: today.evaluated };
+    return { date: days[i].date, level, score, signals: today.signals, since: level === "none" ? null : since, reasons, ready: true, message, consecutiveDays: level === "none" ? 0 : run, evaluated: today.evaluated,
+      sensitivity: sens, headsUp: headsUpAt(days, i) };
   }
 
   /* ============================================================
@@ -8623,11 +8712,11 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
     // contract items
     warning, cardio, drivers, stress,
     // helpers for UI / tests
-    warningSignalsAt, driversStatus, vo2Norm, analyseWorkout,
+    warningSignalsAt, warningBaseline, headsUpAt, driversStatus, vo2Norm, analyseWorkout,
     // statistics
     stats: { lgamma, betainc, tTwoSided, tCdf, tInv, gammaincP, normCdf, normInv, rank, pearson, spearman, welch, bhAdjust, robust, median, mean, hrAt },
     // constants
-    WARN, CARDIO, VO2_NORMS, DRIVERS, STRESS,
+    WARN, WARN_SENS: SENS, CARDIO, VO2_NORMS, DRIVERS, STRESS,
     METHODS_ANALYTICS2,
   });
   if (typeof module !== "undefined" && module.exports) module.exports = A;
@@ -10495,7 +10584,7 @@ else if (typeof window !== "undefined") window.PulseCore = PulseCore;
   "use strict";
   const E = root.CadenceEngine;
   const Views = (root.Views = root.Views || {});
-  const ORDER = ["overview", "sleep", "recovery", "strain", "performance", "health", "cycle", "calories", "insights", "journal", "trends", "coach", "settings", "goals", "records", "weekly", "share",
+  const ORDER = ["overview", "sleep", "recovery", "strain", "performance", "health", "cycle", "calories", "insights", "journal", "trends", "coach", "settings", "goals", "records", "weekly", "share", "metrics", "signals",
     /* v1 view keys, still shown if a file registers them */ "today", "activity", "fuel", "data"];
   const DEFAULT_DOB = "2001-02-09";
   const DEFAULT_VIEW = "overview";
@@ -11760,6 +11849,8 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
       [["strain"], "Today's load, target and heart rate"],
     ]],
     ["Health", [
+      [["metrics"], "Key metrics and their history"],
+      [["signals"], "Body signals and early warning"],
       [["bioage", "biological-age", "biologicalAge", "bio", "age", "healthspan"], "Your body's age from wearable data"],
       [["stress", "stress-monitor"], "Stress through the day"],
       [["energy", "energybank", "energy-bank", "energyBank"], "How much you have left today"],
@@ -13108,7 +13199,7 @@ html.sh-lock,html.sh-lock body{overflow:hidden}
       const names = Array.isArray(w.signals) ? w.signals.map((s) => s && s.metric).filter((x) => typeof x === "string").slice(0, 3) : [];
       return tile(lvl === "alert" ? "Early warning" : "Watch", n ? `${count(n)}<span class="metric-unit"> signal${n === 1 ? "" : "s"}</span>` : (lvl === "alert" ? "Alert" : "Watch"),
         names.length ? esc(names.join(" · ")) : "Body signals off baseline",
-        { view: "insights", cls: "ov-warn cv-warn", color: lvl === "alert" ? "var(--red)" : "var(--yellow)", aria: `Early warning, ${lvl}: open Insights` });
+        { view: "signals", cls: "ov-warn cv-warn", color: lvl === "alert" ? "var(--red)" : "var(--yellow)", aria: `Early warning, ${lvl}: open Body signals` });
     } catch (e) { return ""; }
   }
 
@@ -17404,8 +17495,8 @@ html[data-hdr="title"] .pb-sum{margin-top:0}
   const esc = (s) => (window.App && App.esc ? App.esc(s == null ? "" : String(s)) : String(s == null ? "" : s));
 
   /* build info: a build step may set window.CADENCE_BUILD = { version, date }; these are the fallbacks */
-  const VERSION = "7.0";
-  const BUILD_DATE = "2026-10-31";
+  const VERSION = "8.0";
+  const BUILD_DATE = "2026-11-04";
   function build() {
     const b = (typeof window !== "undefined" && window.CADENCE_BUILD) || {};
     return { version: b.version || VERSION, date: b.date || BUILD_DATE };
@@ -20417,7 +20508,7 @@ html[data-theme="blush"] .cy-pc.taken{color:#fff}
   }
 })();
 </script>
-<script>/* Cadence — Settings: app theme and optional features (More → Settings). */
+<script>/* Cadence — Settings: app theme, optional features and early warning sensitivity (More → Settings). */
 (function () {
   "use strict";
   const Views = (window.Views = window.Views || {});
@@ -20426,6 +20517,14 @@ html[data-theme="blush"] .cy-pc.taken{color:#fff}
   function switchRow(key, on, title, desc) {
     return `<button type="button" class="st-row" role="switch" aria-checked="${on}" data-action="st-feature" data-k="${key}">` +
       `<span class="st-row-t"><b>${esc(title)}</b><small>${esc(desc)}</small></span><i class="st-switch${on ? " on" : ""}" aria-hidden="true"></i></button>`;
+  }
+
+  /* early warning sensitivity lives in doc "signals" ({sensitivity}); views-signals.js reads it */
+  function sensGet() {
+    try { const d = App.docGet("signals"); return d && d.sensitivity === "sensitive" ? "sensitive" : "normal"; } catch (e) { return "normal"; }
+  }
+  function sensBtn(v, cur, title, sub) {
+    return `<button type="button" class="st-sens-b${cur === v ? " on" : ""}" data-action="st-sens" data-v="${v}" aria-pressed="${cur === v}"><b>${esc(title)}</b><span>${esc(sub)}</span></button>`;
   }
 
   Views.settings = {
@@ -20439,6 +20538,7 @@ html[data-theme="blush"] .cy-pc.taken{color:#fff}
         `<span class="st-sw" style="background:${esc(t.sw[0])}"><i style="background:${esc(t.sw[1])}"></i><i style="background:${esc(t.sw[2] || t.sw[1])}"></i></span>` +
         `<b>${esc(t.name)}</b><span>${esc(t.sub)}</span></button>`).join("");
       const cycleOn = App.features.get("cycle");
+      const sens = sensGet();
       return `<div class="page one-col v-settings">
         <section class="card st-card"><div class="card-head"><h2>Theme</h2><span class="card-meta">Whole app</span></div>
           <div class="st-themes">${themes}</div>
@@ -20448,6 +20548,11 @@ html[data-theme="blush"] .cy-pc.taken{color:#fff}
           ${switchRow("cycle", cycleOn, "Cycle tracking", cycleOn ? "On: the Cycle tab is in the bottom bar." : "Turn on to add a Cycle tab for periods, symptoms, predictions and birth control.")}
           ${cycleOn ? `<a class="st-link" href="#cycle">Open Cycle<span aria-hidden="true">›</span></a>` : ""}
           <p class="muted st-note">Turning it off only hides the tab. Anything you logged stays saved on this device.</p>
+        </section>
+        <section class="card st-card"><div class="card-head"><h2>Early warning sensitivity</h2><span class="card-meta">Body signals</span></div>
+          <div class="st-sens" role="group" aria-label="Early warning sensitivity">${sensBtn("normal", sens, "Normal", "Fewer alerts")}${sensBtn("sensitive", sens, "Sensitive", "Flags smaller changes")}</div>
+          <p class="muted st-note">Sensitive flags smaller changes in your resting heart rate, HRV, breathing, skin temperature and blood oxygen. You may hear about a cold sooner, and get more false alarms.</p>
+          <a class="st-link" href="#signals">Open Body signals<span aria-hidden="true">›</span></a>
         </section>
         <section class="card st-card"><div class="card-head"><h2>More settings</h2></div>
           <a class="st-link" href="#data">Data, sync and profile<span aria-hidden="true">›</span></a>
@@ -20476,6 +20581,11 @@ html[data-theme="blush"] .cy-pc.taken{color:#fff}
 .st-link{display:flex;align-items:center;justify-content:space-between;min-height:48px;padding:0 2px;border-top:1px solid var(--border);color:var(--foreground);text-decoration:none;font-weight:600}
 .st-link span{color:var(--muted);font-size:20px}
 .st-note{margin:0;font-size:12.5px}
+.st-sens{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.st-sens-b{display:flex;flex-direction:column;gap:2px;min-height:56px;padding:10px 12px;border:0;border-radius:14px;background:var(--inset);color:var(--foreground);font:inherit;text-align:left;cursor:pointer;box-shadow:inset 0 0 0 1px var(--border)}
+.st-sens-b b{font-size:14.5px;font-weight:600}
+.st-sens-b span{font-size:12px;color:var(--muted)}
+.st-sens-b.on{box-shadow:inset 0 0 0 2px var(--accent)}
 @media (prefers-reduced-motion: reduce){.st-switch,.st-switch::after{transition:none}}
 `,
   };
@@ -20484,6 +20594,14 @@ html[data-theme="blush"] .cy-pc.taken{color:#fff}
     App.theme.set(el.dataset.v);
     const t = App.theme.list().find((x) => x.key === el.dataset.v);
     if (t) App.toast(`${t.name} theme on`);
+  });
+  App.on("st-sens", (el) => {
+    const v = el.dataset.v === "sensitive" ? "sensitive" : "normal";
+    if (v === sensGet()) return;
+    let d = null;
+    try { d = App.docGet("signals"); } catch (e) {}
+    App.docSet("signals", Object.assign({}, d && typeof d === "object" ? d : {}, { sensitivity: v }));
+    App.toast(v === "sensitive" ? "Sensitive early warning on" : "Normal early warning on");
   });
   App.on("st-feature", (el) => {
     const k = el.dataset.k;
@@ -21175,19 +21293,18 @@ html[data-theme="blush"] .rec .rec-streak.on{border-color:transparent;box-shadow
   window.CadenceRecords.homeCard = homeCard;
 })();
 </script>
-<script>/* Cadence — Goals, Monday summary, and two Home cards (week in review, illness early warning).
+<script>/* Cadence — Goals, Monday summary, and the "week in review" Home card.
  *
  *   Views.goals   user-set goals (daily steps, daily active kcal, sleep hours, workouts per week, weight target with
  *                 direction) kept in doc "goals"; rings for today / this week, streaks, 14-day history, weekly review.
  *   Views.weekly  "Monday summary" for the last full Monday–Sunday week: what changed, why, exactly three actions;
  *                 optional "Rewrite with AI" that streams a short summary from the computed facts only.
- *   Home cards    (a) "Your week in review" Monday–Wednesday until the summary is opened;
- *                 (b) illness early warning when CadenceAnalytics.warning is "watch"/"alert" for the latest day,
- *                     dismissible for that day.
+ *   Home card     "Your week in review" Monday–Wednesday until the summary is opened. (The illness early-warning
+ *                 card moved to views-signals.js "Body signals" in v8; warnInfo stays as a pure helper.)
  *
  * doc "goals" = { goals: { steps:{target}, active:{target}, sleep:{target}, workouts:{target},
  *                          weight:{target, dir:"lose"|"gain"|"keep", from, set} },
- *                 ui: { weeklySeen: "<Monday of the week it was opened>", warnDismissed: "<date>" } }
+ *                 ui: { weeklySeen: "<Monday of the week it was opened>" } }
  * Goals start unset. Pure helpers are on window.CadenceGoals (Node: module.exports) for tests.
  */
 (function (root) {
@@ -22089,19 +22206,10 @@ html[data-theme="blush"] .rec .rec-streak.on{border-color:transparent;box-shadow
 .glh-k{font-size:11px;font-weight:700;letter-spacing:var(--track-caps);text-transform:uppercase;color:var(--glh-c)}
 .glh-t{font-size:16px;font-weight:600;line-height:1.3;color:var(--foreground)}
 .glh-s{font-size:13.5px;line-height:1.45;color:var(--foreground-secondary)}
-.glh-v{display:flex;flex-wrap:wrap;gap:6px}
-.glh-vi{display:inline-flex;align-items:baseline;gap:6px;padding:6px 10px;border-radius:10px;background:var(--inset);font-size:12.5px;color:var(--muted);min-width:0}
-.glh-vi b{font-family:var(--f-num);font-size:14.5px;font-weight:700;color:var(--foreground);white-space:nowrap}
-.glh-vi .glh-l{color:var(--foreground-secondary);font-weight:600}
-.glh-vi i{font-style:normal;font-size:9px;color:var(--glh-c)}
-.glh-b{display:flex;gap:8px;flex-wrap:wrap}
-.glh-b .btn{min-height:44px;flex:1 1 auto;display:inline-flex;align-items:center;justify-content:center;gap:6px}
 button.glh-card{width:100%;text-align:left;border:0;font:inherit;color:inherit;cursor:pointer}
 button.glh-card:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .glh-chev{flex:none;color:var(--muted);align-self:center}
 .glh-wk{--glh-c:var(--coach, var(--strain))}
-.glh-warn{--glh-c:var(--warning)}
-.glh-warn.alert{--glh-c:var(--warning)}
 `,
   };
 
@@ -22235,39 +22343,6 @@ button.glh-card:focus-visible{outline:2px solid var(--accent);outline-offset:2px
     return k >= 0 && ctx.i === k;
   };
   App.homeCards.push({
-    key: "gl-warning",
-    order: 10,
-    render(ctx) {
-      if (!ctx || !ctx.days || !ctx.days.length || !isLatest(ctx)) return "";
-      const A = root.CadenceAnalytics;
-      if (!A || typeof A.warning !== "function") return "";
-      let w = null;
-      try { w = A.warning(ctx.days, ctx.derived, ctx.i); } catch (e) { return ""; }
-      const info = warnInfo(w);
-      if (!info) return "";
-      const ui = doc().ui || {};
-      if (ui.warnDismissed && ui.warnDismissed === info.date) return "";
-      const d = ctx.derived && ctx.derived[ctx.i];
-      const t = d && Array.isArray(d.strainTarget) && isNum(d.strainTarget[0]) && isNum(d.strainTarget[1]) ? d.strainTarget : null;
-      // an easier day: stay at the low end of today's target (or half of it when the low end is zero)
-      const cap = t ? (t[0] > 0 ? t[0] : t[1] * 0.5) : null;
-      const capTxt = isNum(cap) && App.strainText ? App.strainText(cap, d) : null;
-      const sofar = d && isNum(d.strain) && App.strainText ? App.strainText(d.strain, d) : null;
-      let easy = capTxt ? `Take an easier day: keep strain under ${capTxt} of today's target` : "Take an easier day";
-      easy += sofar && isNum(d.strain) && isNum(cap) && d.strain >= cap ? ` (you're at ${sofar}, so rest for the rest of the day)` : "";
-      easy += info.level === "alert" ? ", drink water and get to bed early. If you feel unwell, rest, and see a doctor if it gets worse." : ", and see how you feel tomorrow.";
-      const vit = info.vitals.length
-        ? `<div class="glh-v" aria-label="Vitals that moved">${info.vitals.map((v) => `<span class="glh-vi"><span class="glh-l">${esc(v.label)}</span><b>${esc(v.now)}</b><i aria-hidden="true">${v.dir === "up" ? "▲" : "▼"}</i><span>${esc(v.usual)}</span></span>`).join("")}</div>`
-        : "";
-      return `<section class="glh"><div class="glh-card glh-warn ${info.level}" role="region" aria-label="Early warning">
-        <div class="glh-h"><span class="glh-i">${ic("heart-pulse", 20, 2)}</span><div class="glh-m"><span class="glh-k">${info.level === "alert" ? "Early warning" : "Worth watching"}</span><span class="glh-t">${esc(info.title)}</span><span class="glh-s">${esc(info.lead)}</span></div></div>
-        ${vit}
-        <p class="glh-s">${esc(easy)}</p>
-        <div class="glh-b"><button type="button" class="btn small ghost" data-action="gl-warn-dismiss" data-date="${esc(info.date)}">Dismiss for today</button><button type="button" class="btn small" data-action="core-go" data-view="insights">See details</button></div>
-      </div></section>`;
-    },
-  });
-  App.homeCards.push({
     key: "gl-week",
     order: 20,
     render(ctx) {
@@ -22351,12 +22426,6 @@ button.glh-card:focus-visible{outline:2px solid var(--accent);outline-offset:2px
     const t = ev.target;
     if (!t || t.name !== "dir" || !t.closest || !t.closest(".gl-dir")) return;
     t.closest(".gl-dir").querySelectorAll("label").forEach((l) => l.classList.toggle("on", l.contains(t)));
-  });
-  App.on("gl-warn-dismiss", (el) => {
-    const d = doc();
-    d.ui = { ...(d.ui && typeof d.ui === "object" ? d.ui : {}), warnDismissed: el.dataset.date || App.todayStr() };
-    save(d);
-    App.toast("Hidden for today.");
   });
   App.on("gl-ai", () => { runAi(); });
 })(typeof window !== "undefined" ? window : globalThis);
@@ -25285,6 +25354,1803 @@ html.aix-lock,html.aix-lock body{overflow:hidden}
   window.CadenceAIPlus = { payload, scan, open: openFor, close, _cache: cache, _hash: hash };
 })();
 </script>
+<script>/* Cadence — band battery (CONTRACT-V8 §2). window.CadenceDevice
+ *
+ * Data: doc "device" = { devices:[{id, type, name, version, battery, status, lastSync, features}], fetchedAt,
+ *   history:[{t, level, id}], access:"granted"|"missing" }. Written by ingest(), which GoogleHealth.refreshDevices()
+ *   calls after each sync (site build only; google-health.js is not in the artifact build, where this file just
+ *   reads whatever doc exists and shows nothing without one).
+ *   History: a reading is appended per device only when its level changed or ≥ 3 h passed; capped at 500 entries.
+ *
+ *   CadenceDevice.get()            → normalised doc or null
+ *   CadenceDevice.primary(doc?)    → the band (tracker/watch with a battery reading first) or null
+ *   CadenceDevice.renderChip(ctx)  → Home html: slim chip / low-battery card / not-synced card / ""
+ *   CadenceDevice.renderSection()  → Body signals "Band" section html ("" when not connected and no data)
+ *   CadenceDevice.afterSection(el) → mounts the battery chart if the caller did not
+ *   CadenceDevice.ingest(result)   → saves a GoogleHealth.fetchDevices() result into the doc
+ *
+ * Home card: App.homeCards key "device", order 6. Never logs device data or tokens.
+ */
+(function () {
+  "use strict";
+  const App = window.App;
+  const isNum = (v) => typeof v === "number" && isFinite(v);
+  const DOC = "device";
+  const H = 3600000;
+  const HIST_GAP = 3 * H;
+  const HIST_MAX = 500;
+  const STALE_SYNC = 24 * H; // the band itself hasn't synced with the phone
+  const STALE_FETCH = 24 * H; // Cadence hasn't checked in a while: the reading is old news
+  const LOW = 20, MID = 35;
+  const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const DOWL = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  const STATUS_WORD = { high: "High", medium: "Medium", low: "Low", empty: "Empty" };
+  const STATUS_LEVEL = { high: 85, medium: 50, low: 15, empty: 3 }; // only to draw the icon when there is no %
+
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const now = () => Date.now();
+  const msOf = (v) => {
+    if (isNum(v)) return v;
+    if (typeof v !== "string" || !v) return null;
+    const t = Date.parse(v);
+    return isFinite(t) ? t : null;
+  };
+  const str = (v, max) => (typeof v === "string" && v.trim() ? v.trim().slice(0, max || 60) : "");
+
+  /* ---------------- time words ---------------- */
+  const clock = (t) => {
+    const d = new Date(t);
+    const h = d.getHours(), m = d.getMinutes();
+    return `${h % 12 || 12}:${String(m).padStart(2, "0")} ${h < 12 ? "am" : "pm"}`;
+  };
+  const dayStart = (t) => { const d = new Date(t); d.setHours(0, 0, 0, 0); return d.getTime(); };
+  const daysBetween = (a, b) => Math.round((dayStart(b) - dayStart(a)) / 86400000);
+  /** "just now", "25 min ago", "3 h ago", "yesterday", "4 days ago" */
+  function ago(t, at) {
+    at = isNum(at) ? at : now();
+    const d = Math.max(0, at - t);
+    if (d < 60000) return "just now";
+    if (d < H) return `${Math.floor(d / 60000)} min ago`;
+    const dd = daysBetween(t, at);
+    if (d < 24 * H && dd === 0) return `${Math.floor(d / H)} h ago`;
+    if (dd <= 1) return "yesterday";
+    return `${dd} days ago`;
+  }
+  /** "9:14 am", "yesterday, 9:14 pm", "Monday, 9:14 pm", "12 Oct" */
+  function when(t, at) {
+    at = isNum(at) ? at : now();
+    const dd = daysBetween(t, at);
+    const d = new Date(t);
+    if (dd <= 0) return clock(t);
+    if (dd === 1) return `yesterday, ${clock(t)}`;
+    if (dd < 7) return `${DOWL[d.getDay()]}, ${clock(t)}`;
+    return `${d.getDate()} ${MON[d.getMonth()]}${d.getFullYear() !== new Date(at).getFullYear() ? " " + d.getFullYear() : ""}`;
+  }
+  const dayMonth = (t) => { const d = new Date(t); return `${d.getDate()} ${MON[d.getMonth()]}`; };
+  /* chart label (axis + tooltip), short enough for a few axis labels: "Wed 9 pm" (7-day window) or "4 Nov 9 pm" */
+  const chartStamp = (t, week) => {
+    const d = new Date(t);
+    const h = d.getHours();
+    const hh = `${h % 12 || 12} ${h < 12 ? "am" : "pm"}`;
+    return week ? `${DOW[d.getDay()]} ${hh}` : `${d.getDate()} ${MON[d.getMonth()]} ${hh}`;
+  };
+
+  /* ---------------- doc ---------------- */
+  function normDevice(x, k) {
+    if (!x || typeof x !== "object") return null;
+    const id = str(x.id, 64) || `device-${k + 1}`;
+    const type = ["tracker", "watch", "scale", "device"].includes(x.type) ? x.type : "device";
+    const battery = isNum(x.battery) ? Math.max(0, Math.min(100, Math.round(x.battery))) : null;
+    const status = STATUS_WORD[x.status] ? x.status : null;
+    const ls = msOf(x.lastSync);
+    return {
+      id, type,
+      name: str(x.name) || str(x.version) || (type === "scale" ? "Scale" : "Fitbit tracker"),
+      version: str(x.version) || null,
+      battery, status,
+      lastSync: isNum(ls) ? new Date(ls).toISOString() : null,
+      features: Array.isArray(x.features) ? x.features.filter((f) => typeof f === "string").slice(0, 80) : [],
+    };
+  }
+  function rawDoc() {
+    try {
+      return App && typeof App.docGet === "function" ? App.docGet(DOC) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+  /** get() → {devices, fetchedAt, history, access} or null when there is no doc */
+  function get() {
+    const r = rawDoc();
+    if (!r || typeof r !== "object") return null;
+    const devices = (Array.isArray(r.devices) ? r.devices : []).map(normDevice).filter(Boolean);
+    const history = (Array.isArray(r.history) ? r.history : [])
+      .filter((h) => h && isNum(h.t) && isNum(h.level) && typeof h.id === "string")
+      .map((h) => ({ t: h.t, level: Math.max(0, Math.min(100, Math.round(h.level))), id: h.id }))
+      .sort((a, b) => a.t - b.t);
+    const f = msOf(r.fetchedAt);
+    return { devices, fetchedAt: isNum(f) ? new Date(f).toISOString() : null, history, access: r.access === "missing" ? "missing" : r.access === "granted" ? "granted" : null };
+  }
+  const hasBatt = (d) => d && (isNum(d.battery) || !!d.status);
+  /** the band: a tracker/watch with a battery reading, newest sync first; then anything with a reading */
+  function primary(doc) {
+    doc = doc === undefined ? get() : doc;
+    if (!doc || !doc.devices.length) return null;
+    const rank = (d) => (d.type === "tracker" || d.type === "watch" ? 2 : d.type === "device" ? 1 : 0) * 2 + (hasBatt(d) ? 1 : 0);
+    const list = doc.devices.slice().sort((a, b) => rank(b) - rank(a) || (msOf(b.lastSync) || 0) - (msOf(a.lastSync) || 0));
+    return hasBatt(list[0]) || list[0].type !== "scale" ? list[0] : null;
+  }
+
+  /** appendHistory(history, devices, t) → new history (pure; exported for tests) */
+  function appendHistory(history, devices, t) {
+    const out = (Array.isArray(history) ? history : []).filter((h) => h && isNum(h.t) && isNum(h.level) && typeof h.id === "string").slice();
+    for (const d of devices || []) {
+      if (!d || !isNum(d.battery)) continue;
+      let last = null;
+      for (let k = out.length - 1; k >= 0; k--) if (out[k].id === d.id) { last = out[k]; break; }
+      if (!last || last.level !== d.battery || t - last.t >= HIST_GAP) out.push({ t, level: d.battery, id: d.id });
+    }
+    out.sort((a, b) => a.t - b.t);
+    while (out.length > HIST_MAX) out.shift();
+    return out;
+  }
+
+  /** ingest(result of GoogleHealth.fetchDevices) — keeps the old reading on errors; never throws */
+  function ingest(r) {
+    if (!r || typeof r !== "object" || !App || typeof App.docSet !== "function") return false;
+    const cur = rawDoc() || {};
+    let next = null;
+    if (r.ok && Array.isArray(r.devices)) {
+      const t = msOf(r.fetchedAt) || now();
+      const devices = r.devices.map(normDevice).filter(Boolean).slice(0, 50);
+      next = { devices, fetchedAt: new Date(t).toISOString(), history: appendHistory(cur.history, devices, t), access: "granted" };
+    } else if (r.reason === "no_scope" || r.reason === "forbidden") {
+      if (cur.access === "missing") return false;
+      next = Object.assign({ devices: [], history: [] }, cur, { access: "missing" });
+    } else return false; // network / auth / rate limit: keep what we have
+    try {
+      App.docSet(DOC, next, true);
+      const v = typeof App.view === "function" ? App.view() : "";
+      if ((v === "overview" || v === "signals") && typeof App.rerender === "function") App.rerender();
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /* ---------------- pieces ---------------- */
+  const tone = (lvl) => (!isNum(lvl) ? "none" : lvl <= LOW ? "low" : lvl <= MID ? "mid" : "ok");
+  const levelOf = (d) => (isNum(d.battery) ? d.battery : d.status ? STATUS_LEVEL[d.status] : null);
+  const toneOf = (d) => (isNum(d.battery) ? tone(d.battery) : d.status === "low" || d.status === "empty" ? "low" : d.status === "medium" ? "mid" : d.status ? "ok" : "none");
+  const isLow = (d) => (isNum(d.battery) ? d.battery <= LOW : d.status === "low" || d.status === "empty");
+  const battText = (d) => (isNum(d.battery) ? `${d.battery}%` : d.status ? `Battery ${STATUS_WORD[d.status].toLowerCase()}` : "");
+
+  /** small battery drawn as svg; fill = level; tone colours the fill (red ≤ 20 %, amber ≤ 35 %) */
+  function battIcon(level, tn, w) {
+    w = w || 24;
+    const h = Math.round(w / 2);
+    const bw = w - 3, pad = Math.max(1.5, w / 16);
+    const inner = bw - 2 - pad * 2;
+    const fw = isNum(level) ? Math.max(level > 0 ? 1.5 : 0, (inner * Math.max(0, Math.min(100, level))) / 100) : 0;
+    const sw = w >= 36 ? 1.8 : 1.4;
+    return `<svg class="dev-batt t-${tn}" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" aria-hidden="true" focusable="false">` +
+      `<rect x="${sw / 2}" y="${sw / 2}" width="${bw - sw}" height="${h - sw}" rx="${(h / 4).toFixed(1)}" fill="none" stroke="currentColor" stroke-width="${sw}" opacity=".55"/>` +
+      `<rect x="${bw}" y="${(h * 0.32).toFixed(1)}" width="${(w - bw - 0.3).toFixed(1)}" height="${(h * 0.36).toFixed(1)}" rx="1" fill="currentColor" opacity=".55"/>` +
+      (fw > 0 ? `<rect class="dev-batt-f" x="${(1 + pad).toFixed(1)}" y="${(1 + pad).toFixed(1)}" width="${fw.toFixed(1)}" height="${(h - 2 - pad * 2).toFixed(1)}" rx="${Math.max(1, h / 8).toFixed(1)}"/>` : "") +
+      `</svg>`;
+  }
+  const signalsView = () => !!(window.Views && window.Views.signals);
+  const go = (aria) => (signalsView() ? ` data-action="core-go" data-view="signals" aria-label="${esc(aria)}. Open Body signals"` : ` aria-label="${esc(aria)}"`);
+  const ico = (n, px, sw) => {
+    try { return window.Charts && typeof window.Charts.icon === "function" ? window.Charts.icon(n, px, sw) || "" : ""; } catch (e) { return ""; }
+  };
+  const chev = () => (signalsView() ? `<span class="dev-go" aria-hidden="true">${ico("next", 16, 2)}</span>` : "");
+  const warnIc = () => ico("warning", 20, 2);
+
+  /* ---------------- Home ---------------- */
+  function renderChip(ctx) {
+    if (ctx && Array.isArray(ctx.days) && isNum(ctx.i) && ctx.days.length && ctx.i !== ctx.days.length - 1) return ""; // current state: latest day only
+    const doc = get();
+    const p = primary(doc);
+    if (!p) return "";
+    const at = now();
+    const fetched = msOf(doc.fetchedAt);
+    const ls = msOf(p.lastSync);
+    const tag = signalsView() ? "button" : "div";
+    const btnAttr = tag === "button" ? ` type="button"` : "";
+    const name = esc(p.name);
+    // Cadence hasn't looked in over a day: show the old reading quietly, no alarms
+    if (!isNum(fetched) || at - fetched > STALE_FETCH) {
+      const bt = battText(p);
+      if (!bt) return "";
+      const aria = `${p.name}, ${bt}, checked ${isNum(fetched) ? ago(fetched, at) : "a while ago"}`;
+      return `<${tag}${btnAttr} class="dev-chip dev-old"${go(aria)}>${battIcon(levelOf(p), "none", 22)}<span class="dev-chip-t"><b>${name}</b><span class="dev-dot">·</span><span class="ui-num">${esc(bt)}</span><span class="dev-dot">·</span><span class="dev-chip-s">checked ${esc(isNum(fetched) ? ago(fetched, at) : "a while ago")}</span></span>${chev()}</${tag}>`;
+    }
+    if (isNum(ls) && at - ls > STALE_SYNC) {
+      const since = when(ls, at);
+      const aria = `${p.name} hasn't synced since ${since}`;
+      return `<${tag}${btnAttr} class="card dev-card dev-stale"${go(aria)}><span class="dev-card-ic t-mid">${warnIc()}</span><span class="dev-card-t"><span class="dev-card-h">${name} hasn't synced</span><span class="dev-card-s">Your band hasn't synced since ${esc(since)}. Open the Fitbit app on your phone to sync.</span></span>${chev()}</${tag}>`;
+    }
+    if (isLow(p)) {
+      const pc = isNum(p.battery) ? ` (${p.battery}%)` : "";
+      const aria = `Band battery low${pc}`;
+      return `<${tag}${btnAttr} class="card dev-card dev-low"${go(aria)}><span class="dev-card-ic t-low">${battIcon(levelOf(p), "low", 30)}</span><span class="dev-card-t"><span class="dev-card-h">Band battery low${esc(pc)}</span><span class="dev-card-s">Charge it before bed so you don't miss sleep data.</span>${isNum(ls) ? `<span class="dev-card-m">${name} · synced ${esc(ago(ls, at))}</span>` : ""}</span>${chev()}</${tag}>`;
+    }
+    const bt = battText(p);
+    const aria = `${p.name}, ${bt || "battery unknown"}${isNum(ls) ? `, synced ${ago(ls, at)}` : ""}`;
+    return `<${tag}${btnAttr} class="dev-chip"${go(aria)}>${battIcon(levelOf(p), toneOf(p), 22)}<span class="dev-chip-t"><b>${name}</b>${bt ? `<span class="dev-dot">·</span><span class="ui-num t-${toneOf(p)}">${esc(bt)}</span>` : ""}${isNum(ls) ? `<span class="dev-dot">·</span><span class="dev-chip-s">synced ${esc(ago(ls, at))}</span>` : ""}</span>${chev()}</${tag}>`;
+  }
+
+  /* ---------------- Body signals: Band section ---------------- */
+  const GH = () => (window.GoogleHealth && typeof window.GoogleHealth.connect === "function" ? window.GoogleHealth : null);
+  function access() {
+    const gh = GH();
+    if (!gh) return { connected: false, granted: null, helper: false };
+    let a = {};
+    try { a = (typeof gh.deviceAccess === "function" && gh.deviceAccess()) || {}; } catch (e) { a = {}; }
+    let synced = false;
+    try {
+      const c = App && typeof App.ghConfig === "function" ? App.ghConfig() : null;
+      synced = !!(c && c.clientId && c.lastSync);
+    } catch (e) {}
+    return { connected: !!a.signedIn || synced, granted: a.granted === true ? true : a.granted === false ? false : null, helper: !!a.helper };
+  }
+  const st = { busy: false };
+
+  function allowBlock(text) {
+    return `<div class="dev-allow"><div class="dev-allow-h">${battIcon(null, "none", 30)}<span class="ui-card-t">Band battery</span></div><p>${esc(text)}</p><button class="btn primary dev-allow-b" type="button" data-action="dev-allow"${st.busy ? " disabled" : ""}>${st.busy ? "Waiting for Google…" : "Allow battery access"}</button><p class="caption">Google will ask you to allow Cadence to see your paired devices. Nothing else changes.</p></div>`;
+  }
+
+  function historyChart(doc, p) {
+    const C = window.Charts;
+    const pts = doc.history.filter((h) => h.id === p.id);
+    if (!pts.length) return "";
+    const first = pts[0].t;
+    const note = `<p class="caption dev-note">History builds from ${esc(dayMonth(first))}${pts.length < 2 ? ". The chart appears after a few more syncs." : "."}</p>`;
+    if (pts.length < 2 || !C || typeof C.slot !== "function") return note;
+    const recent = pts.filter((h) => h.t >= now() - 7 * 86400000);
+    const use = (recent.length >= 2 ? recent : pts).slice(-60);
+    const week = use[use.length - 1].t - use[0].t < 6.5 * 86400000 || recent.length >= 2;
+    const data = use.map((h) => ({ label: chartStamp(h.t, week), v: h.level }));
+    const chart = C.slot({ type: "line", data, color: "var(--green)", yMin: 0, yMax: 100, height: 150, fmt: (v) => `${Math.round(v)}%`, label: `Battery history for ${p.name}, ${data.length} readings` });
+    return `<div class="dev-hist"><div class="dev-hist-h"><span class="ui-card-t">Battery history</span><span class="caption">${recent.length >= 2 ? "Last 7 days" : "All readings"}</span></div>${chart}</div>${note}`;
+  }
+
+  function row(label, value) {
+    return `<div class="dev-row"><span class="dev-row-l">${esc(label)}</span><span class="dev-row-v">${value}</span></div>`;
+  }
+
+  function renderSection() {
+    const doc = get();
+    const acc = access();
+    const p = primary(doc);
+    const missing = acc.connected && (acc.granted === false || (acc.granted === null && (!doc || doc.access === "missing" || !p)));
+    if (!p) {
+      if (missing) return `<div class="card dev-sec">${allowBlock("See your band's battery here and get a heads-up on Home when it runs low.")}</div>`;
+      if (acc.connected && doc && doc.fetchedAt && !doc.devices.length) return `<div class="card dev-sec"><p class="dev-empty">Google didn't list a paired band for this account. Pair your Fitbit in the Fitbit app, then sync again.</p></div>`;
+      if (acc.connected && acc.granted === true) return `<div class="card dev-sec"><p class="dev-empty">Your band's battery shows here after the next sync.</p></div>`;
+      return "";
+    }
+    const at = now();
+    const ls = msOf(p.lastSync);
+    const fetched = msOf(doc.fetchedAt);
+    const stale = isNum(ls) && at - ls > STALE_SYNC;
+    const tn = toneOf(p);
+    const big = isNum(p.battery) ? `<span class="dev-big ui-num t-${tn}">${p.battery}<span class="dev-big-u">%</span></span>` : `<span class="dev-big dev-big-w t-${tn}">${esc(p.status ? STATUS_WORD[p.status] : "–")}</span>`;
+    const word = isLow(p) ? "Low: charge before bed" : tn === "mid" ? "Getting low" : hasBatt(p) ? "Battery fine" : "No battery reading";
+    const others = doc.devices.filter((d) => d !== p);
+    const rows = [
+      row("Last synced", isNum(ls) ? `${esc(ago(ls, at))}<span class="dev-row-s"> · ${esc(when(ls, at))}</span>` : "–"),
+      p.status ? row("Battery status", esc(STATUS_WORD[p.status])) : "",
+      p.version && p.version !== p.name ? row("Device", esc(p.version)) : "",
+      isNum(fetched) ? row("Checked by Cadence", esc(ago(fetched, at))) : "",
+    ].join("");
+    const otherHtml = others.length
+      ? `<div class="dev-others">${others.map((d) => `<div class="dev-other">${battIcon(levelOf(d), toneOf(d), 20)}<span class="dev-other-n">${esc(d.name)}</span><span class="dev-other-v ui-num">${esc(battText(d) || "–")}</span></div>`).join("")}</div>`
+      : "";
+    return `<div class="card dev-sec">
+      <div class="dev-hero">${battIcon(levelOf(p), tn, 44)}<div class="dev-hero-t">${big}<span class="dev-hero-n">${esc(p.name)}</span><span class="dev-hero-w t-${tn}">${esc(word)}</span></div></div>
+      ${stale ? `<p class="dev-stale-note">${warnIc()}<span>Your band hasn't synced since ${esc(when(ls, at))}. Open the Fitbit app on your phone to sync. The battery shown is from then.</span></p>` : ""}
+      <div class="dev-rows">${rows}</div>
+      ${historyChart(doc, p)}
+      ${otherHtml}
+      ${missing ? allowBlock("Battery access was turned off. Allow it again to keep this up to date.") : ""}
+    </div>`;
+  }
+
+  function afterSection(el) {
+    if (!el || !el.querySelectorAll || !window.Charts || typeof window.Charts.mount !== "function") return;
+    let need = false;
+    el.querySelectorAll(".dev-sec .chart[data-chart]").forEach((c) => { if (!c.firstElementChild) need = true; });
+    if (need) window.Charts.mount(el);
+  }
+
+  /* ---------------- "Allow battery access" → the existing Google sign-in, asking for the device scope ---------------- */
+  if (App && typeof App.on === "function") {
+    App.on("dev-allow", async () => {
+      const gh = GH();
+      if (!gh || st.busy) return;
+      st.busy = true;
+      App.rerender();
+      let msg = "";
+      try {
+        const r = await gh.connect({ devices: true }); // from the tap, so the Google window may open
+        if (r && r.devices === false) msg = "Battery access wasn't allowed. You can try again any time.";
+        else if (typeof gh.refreshDevices === "function") {
+          const d = await gh.refreshDevices({ force: true });
+          msg = d && d.ok ? "Battery access allowed" : d && (d.reason === "no_scope" || d.reason === "forbidden") ? "Battery access wasn't allowed. You can try again any time." : "Allowed. The battery shows after the next sync.";
+        }
+      } catch (e) {
+        msg = (e && typeof e.message === "string" && e.message) || "Couldn't reach Google. Try again.";
+      }
+      st.busy = false;
+      if (msg && typeof App.toast === "function") App.toast(msg);
+      App.rerender();
+    });
+  }
+
+  /* ---------------- styles (tokens only; both themes) ---------------- */
+  const CSS = `
+.dev-chip{display:flex;align-items:center;gap:10px;width:100%;min-height:44px;padding:8px 14px;border-radius:999px;border:1px solid var(--border);
+  background:linear-gradient(180deg,var(--card-top),var(--card));box-shadow:var(--card-hi,none);color:var(--foreground-secondary);font:inherit;font-size:var(--fs-s,14px);text-align:left;cursor:pointer;box-sizing:border-box}
+div.dev-chip{cursor:default}
+.dev-chip:hover{background:var(--card-hover,var(--card))}
+.dev-chip:focus-visible,.dev-card:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.dev-chip-t{display:flex;align-items:baseline;gap:6px;min-width:0;flex:1;white-space:nowrap;overflow:hidden}
+.dev-chip-t b{color:var(--foreground);font-weight:650;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:0 1 auto}
+.dev-chip-t .ui-num{font-weight:700;color:var(--foreground);flex:none}
+.dev-chip-s{overflow:hidden;text-overflow:ellipsis;min-width:0;flex:0 1 auto}
+.dev-dot{color:var(--muted);flex:none}
+.dev-old .dev-chip-t .ui-num,.dev-old b{color:var(--foreground-secondary)}
+.dev-go{color:var(--muted);display:grid;flex:none;margin-left:auto}
+.dev-batt{flex:none;color:var(--foreground-secondary);display:block}
+.dev-batt-f{fill:var(--foreground-secondary)}
+.dev-batt.t-ok .dev-batt-f{fill:var(--green)}
+.dev-batt.t-mid .dev-batt-f{fill:var(--warning)}
+.dev-batt.t-low .dev-batt-f{fill:var(--red)}
+.dev-batt.t-low{color:var(--red-text)}
+.ui-num.t-low,.dev-big.t-low,.dev-hero-w.t-low{color:var(--red-text)!important}
+.ui-num.t-mid,.dev-big.t-mid,.dev-hero-w.t-mid{color:var(--warning-text)!important}
+button.card.dev-card,div.card.dev-card{display:flex;align-items:center;gap:14px;width:100%;text-align:left;font:inherit;color:inherit;border:0;box-sizing:border-box}
+button.card.dev-card{cursor:pointer}
+.dev-card.card > * + *{margin-top:0}
+.dev-card.dev-low{background:radial-gradient(120% 140% at 0% 0%,rgba(255,0,38,.13),transparent 60%),linear-gradient(180deg,var(--card-top),var(--card))}
+.dev-card.dev-stale{background:radial-gradient(120% 140% at 0% 0%,rgba(255,167,34,.13),transparent 60%),linear-gradient(180deg,var(--card-top),var(--card))}
+.dev-card-ic{flex:none;width:44px;height:44px;border-radius:12px;display:grid;place-items:center;background:rgba(var(--hl),.06)}
+.dev-card-ic.t-mid{color:var(--warning-text)}
+.dev-card-ic.t-low{color:var(--red-text)}
+.dev-card-t{display:flex;flex-direction:column;gap:3px;min-width:0;flex:1}
+.dev-card-h{font-size:16px;font-weight:700;color:var(--foreground);line-height:1.3;overflow-wrap:anywhere}
+.dev-card-s{font-size:var(--fs-s,14px);color:var(--foreground-secondary);line-height:1.4;overflow-wrap:anywhere}
+.dev-card-m{font-size:12px;color:var(--muted);line-height:1.4}
+.dev-sec{display:flex;flex-direction:column;gap:14px}
+.dev-sec.card > * + *{margin-top:0}
+.dev-hero{display:flex;align-items:center;gap:16px}
+.dev-hero .dev-batt{width:56px;height:28px}
+.dev-hero-t{display:flex;flex-direction:column;min-width:0;gap:2px}
+.dev-big{font-family:var(--f-num);font-size:40px;line-height:1;font-weight:700;color:var(--foreground);letter-spacing:-.01em}
+.dev-big-u{font-size:20px;margin-left:2px;color:var(--foreground-secondary);font-weight:600}
+.dev-big-w{font-size:30px}
+.dev-hero-n{font-size:15px;font-weight:650;color:var(--foreground);overflow-wrap:anywhere}
+.dev-hero-w{font-size:13px;color:var(--green-text)}
+.dev-stale-note{display:flex;gap:10px;align-items:flex-start;margin:0;padding:10px 12px;border-radius:12px;background:rgba(var(--hl),.05);color:var(--foreground-secondary);font-size:14px;line-height:1.45}
+.dev-stale-note svg{flex:none;color:var(--warning-text);margin-top:1px}
+.dev-rows{display:flex;flex-direction:column;border-top:1px solid var(--border)}
+.dev-row{display:flex;justify-content:space-between;gap:12px;padding:11px 0;border-bottom:1px solid var(--border);font-size:14px}
+.dev-row-l{color:var(--foreground-secondary);flex:none}
+.dev-row-v{color:var(--foreground);text-align:right;min-width:0;overflow-wrap:anywhere}
+.dev-row-s{color:var(--muted)}
+.dev-hist{display:flex;flex-direction:column;gap:6px}
+.dev-hist-h{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.dev-note{margin:-4px 0 0}
+.dev-others{display:flex;flex-direction:column;gap:2px}
+.dev-other{display:flex;align-items:center;gap:10px;min-height:44px;font-size:14px;color:var(--foreground-secondary)}
+.dev-other-n{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--foreground)}
+.dev-other-v{flex:none}
+.dev-allow{display:flex;flex-direction:column;gap:10px;align-items:flex-start}
+.dev-allow-h{display:flex;align-items:center;gap:10px}
+.dev-allow p{margin:0;color:var(--foreground-secondary);font-size:14px;line-height:1.45}
+.dev-allow .caption{font-size:12px;color:var(--muted)}
+.dev-allow-b{min-height:44px;padding:0 20px}
+.dev-empty{margin:0;color:var(--foreground-secondary);font-size:14px;line-height:1.45}
+@media (prefers-reduced-motion:reduce){.dev-chip,.dev-card{transition:none}}
+`;
+  function injectCss() {
+    if (typeof document === "undefined" || document.getElementById("dev-css")) return;
+    const s = document.createElement("style");
+    s.id = "dev-css";
+    s.textContent = CSS;
+    (document.head || document.documentElement).appendChild(s);
+  }
+  try { injectCss(); } catch (e) {}
+
+  const api = { get, primary, renderChip, renderSection, afterSection, ingest, appendHistory, battIcon, _time: { ago, when } };
+  window.CadenceDevice = api;
+  if (App && Array.isArray(App.homeCards)) App.homeCards.push({ key: "device", order: 6, render: renderChip });
+})();
+</script>
+<script>/* Cadence — Body signals: always-on early warning (CONTRACT-V8 §1).
+ *
+ *   Home card (order 5)  always on the latest day: "Body signals" + status word, five dots (RHR, HRV, Breath, Temp,
+ *                        SpO₂). When something moved: one line of what moved + an easier-day suggestion and
+ *                        "Dismiss for today" (collapses the card to its one-line form; it never hides).
+ *   Views.signals        status hero, per-signal 30-day charts with the personal normal band, past warnings (last
+ *                        180 days), the band (CadenceDevice.renderSection when present), how it works, sensitivity.
+ *
+ * Maths lives in analytics2.js: CadenceAnalytics.warning(days, derived, i, {sensitivity}) and warningBaseline(...).
+ * doc "signals" = { sensitivity: "normal"|"sensitive", dismissed: "<YYYY-MM-DD>" }
+ * window.CadenceSignals = { sensitivity(), state(ctx), episodes(days, derived), META }
+ * Not a diagnosis: the wording stays plain ("may be fighting something", "talk to a doctor if you feel unwell").
+ */
+(function () {
+  "use strict";
+  const Views = (window.Views = window.Views || {});
+  const isNum = (v) => typeof v === "number" && isFinite(v);
+  const DASH = "–";
+  const MINUS = "−";
+  const BASE_NIGHTS = 14;
+
+  /* ---------------- dates ---------------- */
+  const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const utc = (s) => Date.UTC(+s.slice(0, 4), +s.slice(5, 7) - 1, +s.slice(8, 10));
+  const validYmd = (s) => typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s) && isFinite(utc(s));
+  const diffD = (a, b) => Math.round((utc(b) - utc(a)) / 86400000);
+  const dm = (s) => `${+s.slice(8, 10)} ${MON[+s.slice(5, 7) - 1]}`;
+  const dayName = (s) => `${DOW[new Date(utc(s)).getUTCDay()]} ${dm(s)}`;
+  /* "12–13 Oct", "30 Sep – 2 Oct", "12 Oct"; adds the year when it isn't `yr` */
+  function rangeTxt(a, b, yr) {
+    const y = (s) => (yr && s.slice(0, 4) !== yr ? ` ${s.slice(0, 4)}` : "");
+    if (a === b) return dm(a) + y(a);
+    if (a.slice(0, 7) === b.slice(0, 7)) return `${+a.slice(8, 10)}–${dm(b)}${y(b)}`;
+    return `${dm(a)}${a.slice(0, 4) !== b.slice(0, 4) ? y(a) : ""} – ${dm(b)}${y(b)}`;
+  }
+
+  /* ---------------- number text ---------------- */
+  const numTxt = (v, dp) => (isNum(v) ? v.toLocaleString("en-US", { minimumFractionDigits: dp || 0, maximumFractionDigits: dp || 0 }) : DASH);
+  const signed = (v, dp) => {
+    if (!isNum(v)) return DASH;
+    const r = Number(v.toFixed(dp || 0));
+    const t = numTxt(Math.abs(r), dp);
+    return r > 0 ? `+${t}` : r < 0 ? `${MINUS}${t}` : t;
+  };
+
+  /* ---------------- the five signals ---------------- */
+  const META = {
+    rhr: { key: "rhr", label: "Resting heart rate", name: "Resting HR", short: "RHR", unit: "bpm", dp: 0, warnDir: "up", color: "var(--strain)", get: (d) => d && d.restingHr },
+    hrv: { key: "hrv", label: "Heart rate variability", name: "HRV", short: "HRV", unit: "ms", dp: 0, warnDir: "down", color: "var(--hrv)", get: (d) => d && d.hrv },
+    resp: { key: "resp", label: "Breathing rate", name: "Breathing", short: "Breath", unit: "/min", dp: 1, warnDir: "up", color: "var(--sleep)", get: (d) => d && d.respRate },
+    temp: { key: "temp", label: "Skin temperature", name: "Skin temp", short: "Temp", unit: "°C", dp: 1, warnDir: "up", color: "var(--warning)", get: (d) => d && d.skinTempDev },
+    spo2: { key: "spo2", label: "Blood oxygen (SpO₂)", name: "SpO₂", short: "SpO₂", unit: "%", dp: 1, warnDir: "down", color: "var(--optimal)", get: (d) => d && d.spo2 },
+  };
+  const KEYS = ["rhr", "hrv", "resp", "temp", "spo2"];
+
+  /* change vs usual, in the signal's own words: "+6 bpm", "−20%", "+1.2/min", "+0.5 °C", "−2 pts" */
+  function deltaTxt(key, value, base) {
+    if (!isNum(value) || !isNum(base)) return "";
+    if (key === "hrv") return base > 0 ? `${signed((value / base - 1) * 100)}%` : "";
+    if (key === "rhr") return `${signed(value - base)}\u00a0bpm`;
+    if (key === "resp") return `${signed(value - base, 1)}/min`;
+    if (key === "temp") return `${signed(value - base, 1)}\u00a0°C`;
+    if (key === "spo2") return `${signed(value - base, 1)}\u00a0pts`;
+    return "";
+  }
+  const valTxt = (key, v) => {
+    const m = META[key];
+    if (!isNum(v)) return DASH;
+    if (key === "temp") return `${signed(v, 1)}`;
+    return numTxt(v, m.dp);
+  };
+
+  /* ---------------- latest day + store ---------------- */
+  const hasApp = () => typeof App !== "undefined" && App;
+  const today = () => (hasApp() && App.todayStr ? App.todayStr() : new Date().toISOString().slice(0, 10));
+  function latestIdx(days) {
+    const t = today();
+    for (let k = (days || []).length - 1; k >= 0; k--) if (days[k] && validYmd(days[k].date) && days[k].date <= t) return k;
+    return -1;
+  }
+  const DOC = "signals";
+  const doc = () => {
+    try { const d = App.docGet(DOC); return d && typeof d === "object" ? d : {}; } catch (e) { return {}; }
+  };
+  const sensitivity = () => (doc().sensitivity === "sensitive" ? "sensitive" : "normal");
+  function setSensitivity(v, quiet) {
+    const d = doc();
+    d.sensitivity = v === "sensitive" ? "sensitive" : "normal";
+    App.docSet(DOC, d, quiet);
+  }
+
+  const An = () => window.CadenceAnalytics || null;
+
+  /* ---------------- state for the latest day ---------------- */
+  const stCache = { key: "", days: null, val: null };
+  /** state(ctx) → { date, i, status: "normal"|"headsup"|"watch"|"alert"|"learning"|"waiting"|"none", word, tone,
+   *  ready, nights, level, signals:[{key, short, name, unit, value, usual, lo, hi, status, delta, text}], moved, warning,
+   *  headsUp, sensitivity } — signal status: "green"|"amber"|"red"|"grey" (grey = no reading or no baseline yet) */
+  function state(ctx) {
+    const days = (ctx && ctx.days) || (hasApp() ? App.days() : []);
+    const derived = (ctx && ctx.derived) || (hasApp() ? App.derived() : []);
+    const i = ctx && isNum(ctx.i) && ctx.i >= 0 && ctx.i < days.length ? ctx.i : latestIdx(days);
+    const sens = sensitivity();
+    const last = days.length ? days[days.length - 1].date : "";
+    const key = `${days.length}|${last}|${i}|${sens}`;
+    if (stCache.key === key && stCache.days === days && stCache.val) return stCache.val;
+    const val = compute(days, derived, i, sens);
+    stCache.key = key; stCache.days = days; stCache.val = val;
+    return val;
+  }
+  function compute(days, derived, i, sens) {
+    const A = An();
+    const day = i >= 0 ? days[i] : null;
+    const base = { date: day ? day.date : null, i, sensitivity: sens, warning: null, headsUp: null, level: "none", ready: false, nights: 0, moved: "" };
+    const signals = KEYS.map((k) => ({ key: k, short: META[k].short, name: META[k].name, unit: META[k].unit, value: null, usual: null, lo: null, hi: null, status: "grey", delta: "", text: "No reading" }));
+    if (!day || !A || typeof A.warning !== "function") {
+      return Object.assign(base, { status: day ? "none" : "learning", word: day ? "Not available" : `Learning your normal: 0 of ${BASE_NIGHTS} nights`, tone: "grey", signals });
+    }
+    let w = null;
+    try { w = A.warning(days, derived, i, { sensitivity: sens }); } catch (e) { w = null; }
+    const opts = { sensitivity: sens };
+    let nights = 0;
+    for (const s of signals) {
+      const m = META[s.key];
+      const v = m.get(day);
+      s.value = isNum(v) ? v : null;
+      let b = null;
+      try { b = typeof A.warningBaseline === "function" ? A.warningBaseline(days, i, s.key, opts) : null; } catch (e) { b = null; }
+      if (b && (s.key === "rhr" || s.key === "hrv")) nights = Math.max(nights, b.n || 0);
+      if (b && b.ready) { s.usual = b.median; s.lo = b.lo; s.hi = b.hi; }
+      if (!isNum(s.value)) { s.status = "grey"; s.text = "No reading"; continue; }
+      const sig = w && Array.isArray(w.signals) ? w.signals.find((x) => x && x.metric === s.key) : null;
+      if (sig) {
+        s.status = w.level === "alert" ? "red" : "amber";
+        s.delta = deltaTxt(s.key, s.value, isNum(sig.baseline) ? sig.baseline : s.usual);
+        s.text = s.key === "spo2" && s.value < 94 ? "Below 94%" : `${s.delta} vs usual`;
+        continue;
+      }
+      if (!b || !b.ready) { s.status = "grey"; s.text = "Learning"; continue; }
+      s.delta = deltaTxt(s.key, s.value, s.usual);
+      if (w && w.headsUp && w.headsUp.metric === s.key) { s.status = "amber"; s.text = `${s.delta} vs usual, trending`; }
+      else { s.status = "green"; s.text = "In your normal range"; }
+    }
+    base.nights = Math.min(BASE_NIGHTS, nights);
+    base.warning = w;
+    base.headsUp = (w && w.headsUp) || null;
+    base.level = (w && w.level) || "none";
+    base.ready = !!(w && w.ready);
+    base.signals = signals;
+    let status, word, tone;
+    if (!base.ready) {
+      if (nights >= BASE_NIGHTS) { status = "waiting"; word = "Waiting for last night's readings"; }
+      else { status = "learning"; word = `Learning your normal: ${base.nights} of ${BASE_NIGHTS} nights`; }
+      tone = "grey";
+    } else if (base.level === "alert") { status = "alert"; word = "Early warning"; tone = "red"; }
+    else if (base.level === "watch") { status = "watch"; word = "Worth watching"; tone = "amber"; }
+    else if ((w.signals && w.signals.length) || base.headsUp) { status = "headsup"; word = "Heads-up"; tone = "amber"; }
+    else { status = "normal"; word = "All normal"; tone = "green"; }
+    base.status = status; base.word = word; base.tone = tone;
+    // one line of what moved
+    const moved = signals.filter((s) => s.status === "red" || (s.status === "amber" && w.signals.some((x) => x.metric === s.key))).map((s) => `${s.name} ${s.key === "spo2" && isNum(s.value) && s.value < 94 ? `${numTxt(s.value, 1)}%` : s.delta}`);
+    if (status === "alert") base.moved = `Your body may be fighting something: ${moved.join(", ")}.`;
+    else if (status === "watch") {
+      const run = isNum(w.consecutiveDays) && w.consecutiveDays > 1 ? `, ${w.consecutiveDays} days in a row` : "";
+      base.moved = moved.length === 1 ? `${moved[0]} vs your normal${run}.` : `A few signals are off your normal: ${moved.join(", ")}${run}.`;
+    }
+    else if (status === "headsup") base.moved = moved.length ? `${moved.join(", ")} vs your usual. One change on its own is common.` : base.headsUp ? base.headsUp.text : "";
+    return base;
+  }
+
+  /* easier-day advice (from the old Home early-warning card): stay under the low end of today's strain target */
+  function advice(st, d) {
+    const t = d && Array.isArray(d.strainTarget) && isNum(d.strainTarget[0]) && isNum(d.strainTarget[1]) ? d.strainTarget : null;
+    const cap = t ? (t[0] > 0 ? t[0] : t[1] * 0.5) : null;
+    const capTxt = isNum(cap) && App.strainText ? App.strainText(cap, d) : null;
+    const sofar = d && isNum(d.strain) && App.strainText ? App.strainText(d.strain, d) : null;
+    let s = capTxt ? `Take an easier day: keep strain under ${capTxt} of today's target` : "Take an easier day";
+    s += sofar && isNum(d.strain) && isNum(cap) && d.strain >= cap ? ` (you're at ${sofar}, so rest for the rest of the day)` : "";
+    if (st.status === "alert") s += ", drink water and get to bed early. If you feel unwell, rest, and talk to a doctor if it gets worse.";
+    else if (st.status === "watch") s += ", and see how you feel tomorrow.";
+    else s = (capTxt ? `Nothing to worry about yet. If you can, keep strain under ${capTxt} of today's target` : "Nothing to worry about yet. An easier day helps") + " and check again tomorrow.";
+    return s;
+  }
+
+  /* ---------------- past warnings (episodes) ---------------- */
+  const epCache = { key: "", days: null, val: null };
+  /** episodes(days, derived) → newest first [{start, end, level, days, ongoing, items:[{key, name, delta}]}] (last 180 days) */
+  function episodes(days, derived) {
+    const A = An();
+    if (!A || typeof A.warning !== "function" || !Array.isArray(days) || !days.length) return [];
+    const sens = sensitivity();
+    const iL = latestIdx(days);
+    if (iL < 0) return [];
+    const key = `${days.length}|${days[0].date}|${days[days.length - 1].date}|${iL}|${sens}`;
+    if (epCache.key === key && epCache.days === days) return epCache.val;
+    const endDate = days[iL].date;
+    const out = [];
+    let cur = null;
+    const rank = { watch: 1, alert: 2 };
+    for (let k = 0; k <= iL; k++) {
+      const d = days[k];
+      if (!d || !validYmd(d.date) || diffD(d.date, endDate) >= 180) continue;
+      let w = null;
+      try { w = A.warning(days, derived, k, { sensitivity: sens }); } catch (e) { w = null; }
+      const on = w && (w.level === "watch" || w.level === "alert");
+      if (!on) { cur = null; continue; }
+      if (!cur || diffD(cur.end, d.date) !== 1) { cur = { start: d.date, end: d.date, level: w.level, days: 0, sig: {} }; out.push(cur); }
+      cur.end = d.date;
+      cur.days++;
+      if (rank[w.level] > rank[cur.level]) cur.level = w.level;
+      for (const s of w.signals || []) {
+        if (!s || !META[s.metric]) continue;
+        const dev = s.metric === "hrv" ? (isNum(s.baseline) && s.baseline > 0 ? 1 - s.value / s.baseline : 0) : s.metric === "spo2" ? (isNum(s.baseline) ? s.baseline - s.value : 94 - s.value) : isNum(s.baseline) ? s.value - s.baseline : 0;
+        const prev = cur.sig[s.metric];
+        if (!prev || dev > prev.dev) cur.sig[s.metric] = { dev, value: s.value, baseline: s.baseline };
+      }
+    }
+    const val = out.reverse().map((e) => ({
+      start: e.start, end: e.end, level: e.level, days: e.days, ongoing: e.end === endDate,
+      items: KEYS.filter((k) => e.sig[k]).map((k) => {
+        const s = e.sig[k];
+        const delta = isNum(s.baseline) ? deltaTxt(k, s.value, s.baseline) : k === "spo2" ? `${numTxt(s.value, 1)}%` : "";
+        return { key: k, name: META[k].name, delta };
+      }),
+    }));
+    epCache.key = key; epCache.days = days; epCache.val = val;
+    return val;
+  }
+
+  window.CadenceSignals = { sensitivity, setSensitivity, state, episodes, deltaTxt, rangeTxt, META, KEYS };
+
+  if (!hasApp() || typeof document === "undefined") return;
+
+  /* ======================================================================
+   * UI
+   * ====================================================================== */
+  const esc = (s) => App.esc(s == null ? "" : String(s));
+  const ic = (n, px, sw) => {
+    try { return (window.Charts && Charts.icon && Charts.icon(n, px || 18, sw)) || ""; } catch (e) { return ""; }
+  };
+  const C = () => window.Charts || {};
+  const TONE_WORD = { green: "Normal", amber: "Off a little", red: "Off", grey: "No reading" };
+
+  function dots(st, big) {
+    return `<ul class="sg-dots${big ? " big" : ""}" aria-label="Signals">${st.signals.map((s) =>
+      `<li class="sg-dot t-${s.status}"><i aria-hidden="true"></i><span>${esc(s.short)}</span><b class="sg-vh">${esc(s.name)}: ${esc(s.status === "grey" ? s.text : TONE_WORD[s.status])}</b></li>`).join("")}</ul>`;
+  }
+
+  /* ---------------- Home card ---------------- */
+  function homeCard(ctx) {
+    if (!ctx || !ctx.days || !ctx.days.length) return "";
+    const k = latestIdx(ctx.days);
+    if (k < 0 || ctx.i !== k) return "";
+    const st = state(ctx);
+    const flagged = st.status === "alert" || st.status === "watch" || st.status === "headsup";
+    const dismissed = flagged && doc().dismissed === st.date;
+    const open = flagged && !dismissed;
+    const d = ctx.derived && ctx.derived[ctx.i];
+    const more = open
+      ? `<span class="sg-h-moved">${esc(st.moved)}</span><span class="sg-h-adv">${esc(advice(st, d))}</span>`
+      : "";
+    const sub = st.status === "learning" ? `<span class="sg-h-bar" aria-hidden="true"><i style="width:${Math.round((st.nights / BASE_NIGHTS) * 100)}%"></i></span>` : "";
+    return `<section class="card sg-home tone-${st.tone}${open ? " open" : ""}" aria-label="Body signals">
+      <button type="button" class="sg-home-go" data-action="core-go" data-view="signals" aria-label="Body signals: ${esc(st.word)}. Open details">
+        <span class="sg-h-top"><span class="sg-h-ic">${ic("heart-pulse", 18, 2)}</span><span class="sg-h-t"><span class="sg-h-k">Body signals</span><span class="sg-h-w">${esc(st.word)}</span></span><span class="sg-h-chev">${ic("chevR", 18, 2)}</span></span>
+        ${sub}${dots(st)}${more}
+      </button>
+      ${open ? `<div class="sg-h-b"><button type="button" class="btn small ghost" data-action="sg-dismiss" data-date="${esc(st.date)}">Dismiss for today</button></div>` : ""}
+    </section>`;
+  }
+  App.homeCards.push({ key: "signals", order: 5, render: homeCard });
+
+  /* ---------------- page pieces ---------------- */
+  function hero(st, ctx) {
+    const w = st.warning;
+    const d = ctx.derived && st.i >= 0 ? ctx.derived[st.i] : null;
+    let msg;
+    if (st.status === "learning") msg = st.nights ? `Cadence needs ${BASE_NIGHTS} nights of resting heart rate and HRV to learn what's normal for you. ${BASE_NIGHTS - st.nights} to go.` : "Sync your tracker and wear it to sleep. After about two weeks of nights, Cadence knows your normal and starts watching for changes.";
+    else if (st.status === "waiting") msg = "Your normal is set, but there are no readings from last night yet. Sync your tracker to check today.";
+    else if (st.status === "none") msg = "The early warning isn't available right now.";
+    else if (st.status === "normal") msg = "Your resting heart rate, HRV, breathing, skin temperature and blood oxygen are all within your normal range.";
+    else msg = st.moved;
+    const adv = st.status === "alert" || st.status === "watch" || st.status === "headsup" ? `<p class="sg-hero-adv">${esc(advice(st, d))}</p>` : "";
+    const when = st.date ? `${st.date === today() ? "Last night" : "Latest night"} · ${dayName(st.date)}` : "No nights yet";
+    const bar = st.status === "learning" ? `<div class="sg-learn"><span class="sg-learn-bar" role="progressbar" aria-valuemin="0" aria-valuemax="${BASE_NIGHTS}" aria-valuenow="${st.nights}" aria-label="Nights learned"><i style="width:${Math.round((st.nights / BASE_NIGHTS) * 100)}%"></i></span><span class="sg-learn-n"><b>${st.nights}</b> of ${BASE_NIGHTS} nights</span></div>` : "";
+    const sens = st.sensitivity === "sensitive" ? `<span class="sg-chip">Sensitive</span>` : "";
+    const since = w && w.since && w.consecutiveDays > 1 ? `<p class="sg-hero-since">Started ${esc(dm(w.since))} · ${w.consecutiveDays} days in a row</p>` : "";
+    return `<section class="card sg-hero tone-${st.tone}">
+      <div class="sg-hero-top"><span class="sg-hero-ic">${ic(st.tone === "green" ? "check" : st.tone === "grey" ? "heart-pulse" : "warning", 24, 2)}</span>
+        <div class="sg-hero-t"><span class="sg-hero-when">${esc(when)}${sens}</span><h2 class="sg-hero-w">${esc(st.word === `Learning your normal: ${st.nights} of ${BASE_NIGHTS} nights` ? "Learning your normal" : st.word)}</h2></div></div>
+      ${bar}<p class="sg-hero-msg">${esc(msg)}</p>${since}${adv}
+      ${dots(st, true)}
+    </section>`;
+  }
+
+  function series(days, iL, key, n) {
+    const out = [];
+    if (iL < 0) return out;
+    const end = days[iL].date;
+    const byDate = new Map();
+    for (let k = Math.max(0, iL - n - 5); k <= iL; k++) if (days[k] && validYmd(days[k].date)) byDate.set(days[k].date, days[k]);
+    for (let q = n - 1; q >= 0; q--) {
+      const t = new Date(utc(end) - q * 86400000).toISOString().slice(0, 10);
+      const v = META[key].get(byDate.get(t));
+      out.push({ label: dm(t), v: isNum(v) ? v : null });
+    }
+    return out;
+  }
+
+  function signalRow(s, ctx, iL) {
+    const m = META[s.key];
+    const data = series(ctx.days, iL, s.key, 30);
+    const has = data.some((x) => isNum(x.v));
+    const band = isNum(s.lo) && isNum(s.hi) ? [s.lo, s.hi] : null;
+    const fmtV = (v) => (s.key === "temp" ? signed(v, 1) : numTxt(v, m.dp === 1 && Math.abs(v) < 100 ? 1 : 0));
+    const chart = has && C().slot
+      ? C().slot({ type: "line", data, color: m.color, band, height: 132, area: s.key !== "temp", fmt: fmtV, label: `${m.label}, last 30 days${band ? ", with your normal range" : ""}` })
+      : `<p class="sg-none">No readings in the last 30 days.</p>`;
+    const unit = s.key === "temp" ? "°C vs avg" : m.unit;
+    const usual = isNum(s.usual)
+      ? `Usual <b>${esc(valTxt(s.key, s.usual))}</b>${s.key === "temp" ? " °C" : ""} · normal ${esc(valTxt(s.key, s.lo))}${s.key === "temp" ? " to " : "–"}${esc(valTxt(s.key, s.hi))}`
+      : "Your normal range appears after 14 nights";
+    const tag = s.status === "grey" ? (isNum(s.value) ? "Learning" : "No reading") : s.status === "green" ? "Normal" : s.text.replace(/ vs usual.*$/, "");
+    return `<article class="sg-sig t-${s.status}" aria-label="${esc(m.label)}">
+      <div class="sg-sig-h"><span class="sg-sig-l"><i class="sg-sig-dot" aria-hidden="true"></i>${esc(m.label)}</span><span class="sg-sig-tag">${esc(tag)}</span></div>
+      <div class="sg-sig-v"><span class="sg-sig-n">${esc(isNum(s.value) ? valTxt(s.key, s.value) : DASH)}</span>${isNum(s.value) ? `<span class="sg-sig-u">${esc(unit)}</span>` : ""}<span class="sg-sig-usual">${usual}</span></div>
+      ${chart}
+    </article>`;
+  }
+
+  function pastCard(ctx) {
+    const eps = episodes(ctx.days, ctx.derived);
+    const yr = today().slice(0, 4);
+    if (!eps.length) {
+      return `<p class="sg-none">${ctx.days && ctx.days.length > 20 ? "No warnings in the last 180 days." : "No warnings yet. They'll be listed here with what moved."}</p>`;
+    }
+    const row = (e) => `<li class="sg-ep lv-${e.level}"><i class="sg-ep-dot" aria-hidden="true"></i><div class="sg-ep-m">
+      <span class="sg-ep-t"><b>${esc(rangeTxt(e.start, e.end, yr))}</b> · ${e.level === "alert" ? "Early warning" : "Worth watching"}${e.ongoing ? ` <span class="sg-chip">Now</span>` : ""}</span>
+      <span class="sg-ep-s">${esc(e.items.map((x) => `${x.name} ${x.delta}`.trim()).join(", ") || "Signals off your normal")}</span></div></li>`;
+    const first = eps.slice(0, 6).map(row).join("");
+    const rest = eps.slice(6);
+    return `<ul class="sg-eps">${first}</ul>` + (rest.length
+      ? `<details class="sg-more"><summary>Show ${rest.length} more</summary><ul class="sg-eps">${rest.map(row).join("")}</ul></details>` : "") +
+      `<p class="sg-note">${eps.length} in the last 180 days${sensitivity() === "sensitive" ? " (sensitive setting)" : ""}.</p>`;
+  }
+
+  function sensCard(cur) {
+    const b = (v, t, sub) => `<button type="button" class="sg-sens-b${cur === v ? " on" : ""}" data-action="sg-sens" data-v="${v}" aria-pressed="${cur === v}"><b>${t}</b><span>${sub}</span></button>`;
+    return `<div class="sg-sens" role="group" aria-label="Early warning sensitivity">${b("normal", "Normal", "Fewer alerts")}${b("sensitive", "Sensitive", "Flags smaller changes")}</div>
+      <p class="sg-note">Sensitive flags smaller changes (about a quarter less), so you may hear about a cold sooner, and also get more false alarms.</p>`;
+  }
+
+  const HOW = `<div class="sg-how">
+    <p>Every morning Cadence compares five overnight signals with <b>your own normal</b>: resting heart rate, HRV, breathing rate, skin temperature and blood oxygen.</p>
+    <p><b>Your normal</b> is the middle of your readings over 4 weeks that end two days ago, so a change that is just starting can't hide in it. It needs at least 14 nights. The shaded band on each chart is that normal range.</p>
+    <p><b>A signal</b> counts when resting heart rate or breathing rate rises well above your usual spread, HRV falls well below it, skin temperature is 0.4 °C or more above usual, or blood oxygen drops 2 points or goes under 94%. The sensitive setting uses smaller steps.</p>
+    <p><b>Heads-up</b>: one signal, or resting HR rising (or HRV falling) two days in a row while past your usual. <b>Worth watching</b>: two signals today, or one on two days in a row. <b>Early warning</b>: three signals, or two on two days in a row.</p>
+    <p>Studies with wearables have seen these signals change a day or more before cold or flu symptoms. Alcohol, a hard workout, travel, heat or a short night can do the same, and many illnesses won't show at all. <b>This is not a diagnosis.</b> If you feel unwell, talk to a doctor.</p>
+  </div>`;
+
+  function bandSection() {
+    const D = window.CadenceDevice;
+    if (!D || typeof D.renderSection !== "function") return "";
+    let h = "";
+    try { h = D.renderSection() || ""; } catch (e) { console.warn("Cadence: band section failed", e); h = ""; }
+    return h ? `<section class="ui-sec sg-band"><div class="ui-sec-h"><h2 class="ui-sec-t">Band</h2></div><div class="ui-sec-b sg-band-b">${h}</div></section>` : "";
+  }
+
+  Views.signals = {
+    label: "Body signals",
+    icon: "heart-pulse",
+    dated: false,
+    render(ctx) {
+      const days = (ctx && ctx.days) || [];
+      const iL = latestIdx(days);
+      const st = state({ days, derived: ctx.derived, i: iL });
+      const S = C().section || ((o) => `<section><h2>${esc(o.title)}</h2>${o.body}</section>`);
+      const head = `<header class="page-head"><h1>Body signals</h1><p class="sub">Your overnight vitals compared with your own normal</p></header>`;
+      const rows = st.signals.map((s) => signalRow(s, ctx, iL)).join("");
+      return `<div class="page one-col sg">${head}${hero(st, ctx)}
+        ${S({ title: "Your signals", sub: "Last 30 days", body: `<div class="sg-sigs">${rows}</div>` })}
+        ${S({ title: "Past warnings", body: `<div class="card sg-past">${pastCard(ctx)}</div>` })}
+        ${bandSection()}
+        ${S({ title: "Sensitivity", body: `<div class="card sg-sens-c">${sensCard(st.sensitivity)}</div>` })}
+        ${S({ title: "How it works", collapsible: true, open: false, body: HOW })}
+      </div>`;
+    },
+    after(el) {
+      const D = window.CadenceDevice;
+      if (D && typeof D.afterSection === "function") {
+        const b = (el || document).querySelector && (el || document).querySelector(".sg-band-b");
+        if (b) { try { D.afterSection(b); } catch (e) { console.warn("Cadence: band section after failed", e); } }
+      }
+    },
+    css: `
+.sg{--sg-green:var(--green);--sg-amber:var(--warning);--sg-red:var(--red);--sg-grey:var(--dial-track)}
+.sg-home{--sg-green:var(--green);--sg-amber:var(--warning);--sg-red:var(--red);--sg-grey:var(--dial-track)}
+.sg-home.tone-green,.sg .tone-green{--sg-c:var(--sg-green);--sg-ct:var(--green-text,var(--green))}
+.sg-home.tone-amber,.sg .tone-amber{--sg-c:var(--sg-amber);--sg-ct:var(--warning-text,var(--warning))}
+.sg-home.tone-red,.sg .tone-red{--sg-c:var(--sg-red);--sg-ct:var(--red-text,var(--red))}
+.sg-home.tone-grey,.sg .tone-grey{--sg-c:var(--muted);--sg-ct:var(--foreground-secondary)}
+.sg-vh{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.sg-dots{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:4px}
+.sg-dot{position:relative;display:flex;flex-direction:column;align-items:center;gap:5px;min-width:0}
+.sg-dot i{display:block;width:12px;height:12px;border-radius:50%;background:var(--sg-grey);box-shadow:inset 0 0 0 1px rgba(var(--hl),.08)}
+.sg-dot span{font-size:11px;font-weight:600;letter-spacing:.02em;color:var(--muted);white-space:nowrap}
+.sg-dot.t-green i{background:var(--sg-green)}
+.sg-dot.t-amber i{background:var(--sg-amber);box-shadow:0 0 0 3px color-mix(in srgb,var(--sg-amber) 22%,transparent)}
+.sg-dot.t-red i{background:var(--sg-red);box-shadow:0 0 0 3px color-mix(in srgb,var(--sg-red) 22%,transparent)}
+.sg-dot.t-amber span,.sg-dot.t-red span{color:var(--foreground)}
+.sg-dots.big{padding-top:14px;border-top:1px solid var(--border)}
+.sg-dots.big .sg-dot i{width:14px;height:14px}
+.sg-dots.big .sg-dot span{font-size:12px}
+
+/* Home card */
+.sg-home.card{position:relative;padding:0;overflow:hidden}
+.sg-home.card > * + *{margin-top:0}
+.sg-home::before{content:"";position:absolute;inset:0 auto 0 0;width:4px;background:var(--sg-c);opacity:0}
+.sg-home.open::before{opacity:1}
+.sg-home-go{display:flex;flex-direction:column;gap:12px;width:100%;padding:14px 16px;border:0;background:none;font:inherit;color:inherit;text-align:left;cursor:pointer;border-radius:inherit;min-height:44px}
+.sg-home-go:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.sg-h-top{display:flex;align-items:center;gap:10px;min-width:0}
+.sg-h-ic{flex:none;display:grid;place-items:center;width:32px;height:32px;border-radius:10px;color:var(--sg-c);background:color-mix(in srgb,var(--sg-c) 15%,transparent)}
+.sg-h-t{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1}
+.sg-h-k{font-size:12px;font-weight:700;letter-spacing:var(--track-caps,.08em);text-transform:uppercase;color:var(--foreground-secondary)}
+.sg-h-w{font-size:16px;font-weight:600;line-height:1.3;color:var(--sg-ct);overflow-wrap:anywhere}
+.sg-home.tone-grey .sg-h-w{font-size:14.5px}
+.sg-h-chev{flex:none;color:var(--muted);display:grid}
+.sg-h-bar,.sg-learn-bar{display:block;height:4px;border-radius:2px;background:var(--dial-track);overflow:hidden}
+.sg-h-bar i,.sg-learn-bar i{display:block;height:100%;border-radius:2px;background:var(--accent)}
+.sg-h-moved{font-size:14px;line-height:1.45;color:var(--foreground);font-weight:500}
+.sg-h-adv{font-size:13.5px;line-height:1.45;color:var(--foreground-secondary);margin-top:-6px}
+.sg-h-b{display:flex;justify-content:flex-end;padding:0 10px 10px}
+.sg-h-b .btn{min-height:44px}
+
+/* page */
+.sg .sg-hero{display:flex;flex-direction:column;gap:12px;background:radial-gradient(120% 90% at 0% 0%,color-mix(in srgb,var(--sg-c) 14%,transparent),transparent 62%),linear-gradient(180deg,var(--card-top),var(--card))}
+.sg .sg-hero.card > * + *{margin-top:0}
+.sg .sg-hero-top{display:flex;align-items:center;gap:14px}
+.sg .sg-hero-ic{flex:none;display:grid;place-items:center;width:52px;height:52px;border-radius:50%;color:var(--sg-c);background:color-mix(in srgb,var(--sg-c) 15%,transparent);box-shadow:inset 0 0 0 1.5px color-mix(in srgb,var(--sg-c) 40%,transparent)}
+.sg .sg-hero-t{display:flex;flex-direction:column;gap:2px;min-width:0}
+.sg .sg-hero-when{display:flex;align-items:center;flex-wrap:wrap;gap:6px;font-size:12px;font-weight:700;letter-spacing:var(--track-caps,.08em);text-transform:uppercase;color:var(--muted)}
+.sg .sg-hero-w{margin:0;font-size:24px;line-height:1.2;font-weight:700;color:var(--sg-ct)}
+.sg .sg-hero-msg{margin:0;font-size:15px;line-height:1.5;color:var(--foreground)}
+.sg .sg-hero-since{margin:0;font-size:13px;color:var(--foreground-secondary)}
+.sg .sg-hero-adv{margin:0;padding:10px 12px;border-radius:12px;background:var(--inset);font-size:14px;line-height:1.45;color:var(--foreground-secondary)}
+.sg .sg-learn{display:flex;align-items:center;gap:10px}
+.sg .sg-learn-bar{flex:1;height:6px;border-radius:3px}
+.sg .sg-learn-n{font-size:13px;color:var(--foreground-secondary);white-space:nowrap}
+.sg .sg-learn-n b{font-family:var(--f-num);font-size:16px;color:var(--foreground)}
+.sg .sg-chip{display:inline-flex;align-items:center;height:18px;padding:0 7px;border-radius:6px;font-size:10px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);background:color-mix(in srgb,var(--accent) 14%,transparent);vertical-align:1px}
+.sg .sg-sigs{display:flex;flex-direction:column;gap:10px}
+.sg .sg-sig{--sg-s:var(--sg-grey);display:flex;flex-direction:column;gap:6px;padding:14px 14px 8px;border-radius:var(--radius);background:linear-gradient(180deg,var(--card-top),var(--card));box-shadow:var(--card-hi)}
+.sg .sg-sig.t-green{--sg-s:var(--sg-green)}
+.sg .sg-sig.t-amber{--sg-s:var(--sg-amber)}
+.sg .sg-sig.t-red{--sg-s:var(--sg-red)}
+.sg .sg-sig-h{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}
+.sg .sg-sig-l{display:flex;align-items:center;gap:8px;min-width:0;font-size:12px;font-weight:700;letter-spacing:var(--track-caps,.08em);text-transform:uppercase;color:var(--foreground-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sg .sg-sig-dot{flex:none;width:10px;height:10px;border-radius:50%;background:var(--sg-s)}
+.sg .sg-sig-tag{flex:none;font-size:12px;font-weight:700;color:var(--foreground-secondary);padding:3px 8px;border-radius:8px;background:var(--inset);white-space:nowrap}
+.sg .sg-sig.t-amber .sg-sig-tag{color:var(--warning-text,var(--warning));background:color-mix(in srgb,var(--warning) 13%,transparent)}
+.sg .sg-sig.t-red .sg-sig-tag{color:var(--red-text,var(--red));background:color-mix(in srgb,var(--red) 13%,transparent)}
+.sg .sg-sig.t-green .sg-sig-tag{color:var(--green-text,var(--green));background:color-mix(in srgb,var(--green) 12%,transparent)}
+.sg .sg-sig-v{display:flex;align-items:baseline;flex-wrap:wrap;column-gap:6px;row-gap:2px}
+.sg .sg-sig-n{font-family:var(--f-num);font-weight:700;font-size:30px;line-height:1.05;color:var(--foreground)}
+.sg .sg-sig-u{font-size:13px;color:var(--muted);font-weight:600}
+.sg .sg-sig-usual{flex-basis:100%;font-size:12.5px;color:var(--muted)}
+.sg .sg-sig-usual b{color:var(--foreground-secondary);font-weight:700}
+.sg .sg-none{margin:0;padding:6px 0 8px;font-size:13.5px;line-height:1.45;color:var(--muted)}
+.sg .sg-past{padding-top:6px;padding-bottom:10px}
+.sg .sg-eps{list-style:none;margin:0;padding:0;display:flex;flex-direction:column}
+.sg .sg-ep{display:flex;gap:12px;align-items:flex-start;padding:11px 0;border-bottom:1px solid var(--border)}
+.sg .sg-eps:last-of-type .sg-ep:last-child{border-bottom:0}
+.sg .sg-ep-dot{flex:none;width:10px;height:10px;margin-top:5px;border-radius:50%;background:var(--sg-amber)}
+.sg .sg-ep.lv-alert .sg-ep-dot{background:var(--sg-red)}
+.sg .sg-ep-m{display:flex;flex-direction:column;gap:2px;min-width:0}
+.sg .sg-ep-t{font-size:14.5px;color:var(--foreground-secondary);line-height:1.35}
+.sg .sg-ep-t b{color:var(--foreground);font-weight:700}
+.sg .sg-ep-s{font-size:13px;color:var(--muted);line-height:1.4;overflow-wrap:anywhere}
+.sg .sg-more summary{cursor:pointer;min-height:44px;display:flex;align-items:center;font-weight:600;font-size:14px;color:var(--accent)}
+.sg .sg-note{margin:6px 0 0;font-size:12.5px;line-height:1.45;color:var(--muted)}
+.sg .sg-sens{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.sg .sg-sens-b{display:flex;flex-direction:column;gap:2px;min-height:56px;padding:10px 12px;border:0;border-radius:12px;background:var(--inset);color:var(--foreground);font:inherit;text-align:left;cursor:pointer;box-shadow:inset 0 0 0 1px var(--border)}
+.sg .sg-sens-b b{font-size:15px;font-weight:600}
+.sg .sg-sens-b span{font-size:12.5px;color:var(--muted)}
+.sg .sg-sens-b.on{box-shadow:inset 0 0 0 2px var(--accent)}
+.sg .sg-sens-b:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.sg .sg-how{display:flex;flex-direction:column;gap:10px;padding:2px 2px 6px}
+.sg .sg-how p{margin:0;font-size:14px;line-height:1.55;color:var(--foreground-secondary)}
+.sg .sg-how b{color:var(--foreground);font-weight:600}
+`,
+  };
+
+  /* ---------------- handlers ---------------- */
+  App.on("sg-dismiss", (el) => {
+    const d = doc();
+    d.dismissed = el.dataset.date || today();
+    App.docSet(DOC, d);
+    App.toast("Collapsed for today.");
+  });
+  App.on("sg-sens", (el) => {
+    const v = el.dataset.v === "sensitive" ? "sensitive" : "normal";
+    if (v === sensitivity()) return;
+    setSensitivity(v);
+    App.toast(v === "sensitive" ? "Sensitive early warning on" : "Normal early warning on");
+  });
+})();
+</script>
+<script>/* Cadence — Key metrics: one page with the numbers that matter most, each with its history. Views.metrics
+ *
+ * Sections: Headline (VO₂ max, resting HR, HRV, biological age, recovery, sleep), Fitness (heart-rate drop after
+ * exercise, fitness and fatigue from the training-load model), Sleep (consistency, sleep debt), Vitals (breathing
+ * rate, SpO₂, skin temperature change), Body (weight, BMI; hidden without data) and Activity (steps, active
+ * calories, strain % of target).
+ *
+ * Tile: current value (7-day average for daily numbers, latest estimate for VO₂ max / biological age / sleep debt /
+ * fitness / fatigue, 28-day median for heart-rate drop), change vs the 30-day average (coloured by whether up is
+ * good), and a 30-day sparkline. Tap → in-page detail (#metrics/<key>; browser back closes it): range 1M/3M/6M/1Y/All,
+ * line chart with the personal normal band (middle half of the days in the range: 25th–75th percentile), average,
+ * best and worst with dates, trend text, a general guide where one exists, Pin to Home. The AI "Explain" button on the
+ * chart comes from ai-plus.js (shown only when an AI key exists; it sends that chart's numbers only).
+ *
+ * Pins: App.docSet("metrics", {pins:[keys]}); Home card "metrics-pins" (order 30) shows pinned tiles.
+ *
+ * Data model: built once per data version (cached on the days/derived arrays) and aligned to the days array:
+ * every metric is an array of values (null = no reading). VO₂ max comes from CadenceAnalytics.cardio().trend (one
+ * estimate per day), heart-rate drop from cardio().workouts (hrr60 of sessions hard enough to judge), biological age
+ * from CadenceEngine.bioAge (weekly; the latest call gives 12 weeks, older weeks are filled in lazily when a long
+ * range is opened). Pure helpers are exposed on window.CadenceMetrics for tests. CSS prefix: mx-.
+ */
+(function (root) {
+  "use strict";
+  const isNum = (v) => typeof v === "number" && isFinite(v);
+  const DASH = "–";
+  const MINUS = "−";
+
+  /* ---------------- dates (UTC maths on YYYY-MM-DD) ---------------- */
+  const utc = (s) => Date.UTC(+s.slice(0, 4), +s.slice(5, 7) - 1, +s.slice(8, 10));
+  const ymdU = (t) => new Date(t).toISOString().slice(0, 10);
+  const addD = (s, n) => ymdU(utc(s) + n * 86400000);
+  const diffD = (a, b) => Math.round((utc(b) - utc(a)) / 86400000);
+  const validYmd = (s) => typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s) && isFinite(utc(s));
+  const MON3 = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const DOW3 = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const shortD = (s) => (validYmd(s) ? `${+s.slice(8, 10)} ${MON3[+s.slice(5, 7) - 1]}` : DASH);
+  const longD = (s) => (validYmd(s) ? `${DOW3[new Date(utc(s)).getUTCDay()]} ${shortD(s)}${s.slice(0, 4) !== String(new Date().getFullYear()) ? " " + s.slice(0, 4) : ""}` : DASH);
+
+  /* ---------------- stats ---------------- */
+  const mean = (a) => (a.length ? a.reduce((s, v) => s + v, 0) / a.length : null);
+  function quantile(sorted, q) {
+    if (!sorted.length) return null;
+    const p = (sorted.length - 1) * q, lo = Math.floor(p), hi = Math.ceil(p);
+    return sorted[lo] + (sorted[hi] - sorted[lo]) * (p - lo);
+  }
+  const median = (a) => quantile(a.slice().sort((x, y) => x - y), 0.5);
+  /* first index with days[k].date >= date (binary search; days sorted by date) */
+  function lowerIdx(days, date) {
+    let lo = 0, hi = days.length;
+    while (lo < hi) {
+      const m = (lo + hi) >> 1;
+      if (days[m].date < date) lo = m + 1;
+      else hi = m;
+    }
+    return lo;
+  }
+  /* values of a series with from <= date <= to → [{k, date, v}] */
+  function between(days, vals, from, to) {
+    const out = [];
+    for (let k = lowerIdx(days, from); k < days.length && days[k].date <= to; k++) if (isNum(vals[k])) out.push({ k, date: days[k].date, v: vals[k] });
+    return out;
+  }
+  /* the latest day index on or before `today` (−1 when none) */
+  function latestIdx(days, today) {
+    for (let k = (days || []).length - 1; k >= 0; k--) if (days[k] && validYmd(days[k].date) && (!today || days[k].date <= today)) return k;
+    return -1;
+  }
+
+  /* ---------------- metric definitions ---------------- */
+  const r1 = (v) => Math.round(v * 10) / 10;
+  const numTxt = (v, dp) => {
+    if (!isNum(v)) return DASH;
+    const x = dp ? v : Math.round(v);
+    const s = Math.abs(x).toLocaleString("en-US", { minimumFractionDigits: dp || 0, maximumFractionDigits: dp || 0 });
+    return (x < 0 && s.replace(/[0.,]/g, "") !== "" ? MINUS : "") + s;
+  };
+  const minsTxt = (m) => {
+    if (!isNum(m)) return DASH;
+    const t = Math.round(Math.abs(m)), h = Math.floor(t / 60);
+    return (m < 0 && t ? MINUS : "") + (h ? `${h}h ${t % 60}m` : `${t}m`);
+  };
+  const signed = (v, dp) => {
+    if (!isNum(v)) return DASH;
+    const s = numTxt(Math.abs(v), dp);
+    return /[1-9]/.test(s) ? (v > 0 ? "+" : MINUS) + s : s;
+  };
+
+  /* SECTIONS in page order */
+  const SECTIONS = [
+    ["headline", "Headline"],
+    ["fitness", "Fitness"],
+    ["sleep", "Sleep"],
+    ["vitals", "Vitals"],
+    ["body", "Body"],
+    ["activity", "Activity"],
+  ];
+  /* good: "up" | "down" | null (neutral) · agg: avg7 | latest | med28 · change: avg30 | prev28 | ago28
+     partial: today's value is still running (left out of averages) · eps: smaller changes read as "steady" */
+  const M = [
+    { key: "vo2", sec: "headline", label: "VO₂ max", icon: "activity", color: "var(--optimal)", unit: "ml/kg/min", dp: 1, good: "up", agg: "latest", eps: 0.3, valueNote: "Latest estimate",
+      about: "How much oxygen your body can use at full effort: the best single measure of cardio fitness. Estimated from your resting and maximum heart rate, and from steady runs when you log them." },
+    { key: "rhr", sec: "headline", label: "Resting heart rate", short: "Resting HR", icon: "heart", color: "var(--red)", unit: "bpm", dp: 0, good: "down", agg: "avg7", eps: 0.5,
+      about: "Your heart rate at full rest, measured overnight. It usually drops as fitness improves and rises with stress, illness, alcohol or a hard block of training." },
+    { key: "hrv", sec: "headline", label: "Heart rate variability", short: "HRV", icon: "heart-pulse", color: "var(--hrv)", unit: "ms", dp: 0, good: "up", agg: "avg7", eps: 1,
+      about: "The small changes in time between heartbeats, measured overnight. Higher than your normal usually means you are well recovered; a drop can mean stress, poor sleep or illness." },
+    { key: "bioage", sec: "headline", label: "Biological age", short: "Bio age", icon: "clock", color: "var(--coach)", unit: "yrs", dp: 1, good: "down", agg: "latest", change: "ago28", eps: 0.2, valueNote: "Latest estimate",
+      about: "Your body's age from wearable data: fitness, resting heart rate, HRV, sleep, steps, exercise and BMI over the last 30 days. An estimate, not a medical test." },
+    { key: "recovery", sec: "headline", label: "Recovery", icon: "battery-charging", color: "var(--green)", unit: "%", dUnit: "pts", dp: 0, good: "up", agg: "avg7", eps: 1,
+      about: "How ready your body is each morning, from HRV, resting heart rate, sleep and breathing rate compared with your own 30-day normal." },
+    { key: "sleep", sec: "headline", label: "Sleep duration", short: "Sleep", icon: "moon", color: "var(--sleep)", unit: "", dp: 0, good: "up", agg: "avg7", eps: 5, fmt: minsTxt, dFmt: minsTxt,
+      about: "Time actually asleep each night (time in bed minus time awake)." },
+    { key: "hrr60", sec: "fitness", label: "Heart-rate drop after exercise", short: "HR drop", icon: "timer", color: "var(--warning)", unit: "bpm", dp: 0, good: "up", agg: "med28", change: "prev28", eps: 1, sparse: true, valueNote: "28-day median",
+      about: "How far your heart rate falls in the first minute after a workout ends (HRR60). A faster drop usually means a fitter heart. Only sessions that ended at a real effort are counted." },
+    { key: "fitness", sec: "fitness", label: "Fitness", icon: "trend", color: "var(--strain)", unit: "", dp: 0, good: "up", agg: "latest", eps: 1, valueNote: "Training load, 6 weeks",
+      about: "Your training load averaged over about six weeks (chronic load). It rises slowly as you train more and falls when you rest for long." },
+    { key: "fatigue", sec: "fitness", label: "Fatigue", icon: "zap", color: "var(--warning)", unit: "", dp: 0, good: null, agg: "latest", eps: 1, valueNote: "Training load, 1 week",
+      about: "Your training load averaged over about one week (acute load). When fatigue sits well above fitness you are carrying a lot of recent work." },
+    { key: "consistency", sec: "sleep", label: "Sleep consistency", short: "Consistency", icon: "calendar", color: "var(--sleep)", unit: "%", dUnit: "pts", dp: 0, good: "up", agg: "avg7", eps: 1,
+      about: "How closely your sleep window matches your previous four nights by clock time. Going to bed and waking at similar times helps sleep quality." },
+    { key: "debt", sec: "sleep", label: "Sleep debt", icon: "bed", color: "var(--coach)", unit: "h", dp: 1, good: "down", agg: "latest", eps: 0.2, valueNote: "Last 7 nights",
+      about: "Sleep you missed compared with your sleep need over the last seven nights. It is paid back by sleeping a little longer for a few nights." },
+    { key: "resp", sec: "vitals", label: "Breathing rate", short: "Breathing", icon: "wind", color: "var(--hrv)", unit: "/min", dp: 1, good: null, agg: "avg7", eps: 0.2,
+      about: "Breaths per minute while you sleep. It is very stable for most people, so a rise of one or more breaths is worth noticing." },
+    { key: "spo2", sec: "vitals", label: "Blood oxygen", short: "SpO₂", icon: "droplet", color: "var(--recovery-blue)", unit: "%", dp: 1, good: "up", agg: "avg7", eps: 0.2,
+      about: "The share of your blood's haemoglobin carrying oxygen (SpO₂), measured overnight by the band." },
+    { key: "temp", sec: "vitals", label: "Skin temperature change", short: "Skin temp", icon: "thermo", color: "var(--warning)", unit: "°C", dp: 1, good: null, agg: "avg7", eps: 0.1, fmt: (v) => signed(v, 1), dFmt: (v) => numTxt(Math.abs(v), 2).replace(/0$/, ""),
+      about: "How your skin temperature at night differs from your own baseline. Small changes are normal; a rise for a few nights can come with illness, alcohol, a hot room or hormones." },
+    { key: "weight", sec: "body", label: "Weight", icon: "scale", color: "var(--coach)", unit: "kg", dp: 1, good: null, agg: "avg7", eps: 0.1, sparse: true, hideEmpty: true,
+      about: "Your body weight from your scale or the journal. Day-to-day changes are mostly water, so the weekly average is the number to watch." },
+    { key: "bmi", sec: "body", label: "BMI", icon: "weight", color: "var(--coach)", unit: "", dp: 1, good: null, agg: "avg7", eps: 0.1, sparse: true, hideEmpty: true,
+      about: "Body mass index: weight in kg divided by height in metres squared, using the height in your profile." },
+    { key: "steps", sec: "activity", label: "Steps", icon: "activity", color: "var(--optimal)", unit: "", dp: 0, good: "up", agg: "avg7", partial: true, eps: 100, valueNote: "Daily average, 7 days",
+      about: "Steps a day. Today is still running, so averages use full days only." },
+    { key: "active", sec: "activity", label: "Active calories", icon: "flame", color: "var(--warning)", unit: "kcal", dp: 0, good: "up", agg: "avg7", partial: true, eps: 10, valueNote: "Daily average, 7 days",
+      about: "Energy burned by movement and exercise on top of your resting burn." },
+    { key: "strain", sec: "activity", label: "Average strain", short: "Strain", icon: "gauge", color: "var(--strain)", unit: "%", dUnit: "pts", dp: 0, good: null, agg: "avg7", partial: true, eps: 1, valueNote: "% of daily target, 7 days",
+      about: "How much load your heart carried each day, as a percentage of that day's strain target (100 % = the most your recovery called for)." },
+  ];
+  const DEF = {};
+  for (const m of M) DEF[m.key] = m;
+  const fmtV = (m, v) => (!isNum(v) ? DASH : m.fmt ? m.fmt(v) : numTxt(v, m.dp));
+  const fmtDiff = (m, d) => (!isNum(d) ? DASH : m.dFmt ? m.dFmt(Math.abs(d)) : numTxt(Math.abs(d), m.dp));
+  const unitD = (m) => (m.dUnit != null ? m.dUnit : m.unit);
+
+  /* ---------------- model (one per data version) ---------------- */
+  const cache = new WeakMap();
+  function strainRefOf(d) {
+    const t = d && Array.isArray(d.strainTarget) && isNum(d.strainTarget[1]) && d.strainTarget[1] > 0 ? d.strainTarget[1] : null;
+    if (t) return t;
+    const r = d && isNum(d.recovery) ? d.recovery : null;
+    return r == null ? 14 : r >= 67 ? 18 : r >= 34 ? 14 : 10;
+  }
+  const strainPctFallback = (v, d) => (isNum(v) ? (Math.max(0, v) / strainRefOf(d)) * 100 : null);
+
+  /** build(days, derived, profile, opts) → {days, series:{key:[v|null]}, bio:{done, from}, profile, cardio} (cached) */
+  function build(days, derived, profile, opts) {
+    days = Array.isArray(days) ? days : [];
+    derived = Array.isArray(derived) ? derived : [];
+    const p = profile || {};
+    const pk = JSON.stringify([p.dob, p.sex, p.heightCm, p.weightKg, p.maxHr, p.age]);
+    let byDer = cache.get(days);
+    if (byDer && byDer.der === derived && byDer.pk === pk) return byDer.model;
+    const A = root.CadenceAnalytics || {};
+    const E = root.CadenceEngine || {};
+    const sp = (opts && opts.strainPct) || strainPctFallback;
+    const N = days.length;
+    const arr = () => new Array(N).fill(null);
+    const S = {};
+    for (const m of M) S[m.key] = arr();
+    const height = isNum(p.heightCm) && p.heightCm >= 100 && p.heightCm <= 250 ? p.heightCm / 100 : null;
+    for (let k = 0; k < N; k++) {
+      const d = days[k] || {};
+      const v = derived[k] || {};
+      if (isNum(d.restingHr) && d.restingHr > 20) S.rhr[k] = d.restingHr;
+      if (isNum(d.hrv) && d.hrv > 0) S.hrv[k] = d.hrv;
+      if (isNum(v.recovery)) S.recovery[k] = v.recovery;
+      if (v.sleep && isNum(v.sleep.asleep) && v.sleep.asleep > 0) S.sleep[k] = v.sleep.asleep;
+      if (isNum(v.sleepConsistency)) S.consistency[k] = v.sleepConsistency;
+      if (isNum(d.respRate) && d.respRate > 0) S.resp[k] = d.respRate;
+      if (isNum(d.spo2) && d.spo2 > 50) S.spo2[k] = d.spo2;
+      if (isNum(d.skinTempDev)) S.temp[k] = d.skinTempDev;
+      if (isNum(d.weightKg) && d.weightKg > 20) {
+        S.weight[k] = d.weightKg;
+        if (height) S.bmi[k] = d.weightKg / (height * height);
+      }
+      if (isNum(d.steps) && d.steps >= 0) S.steps[k] = d.steps;
+      const act = v.kcal && isNum(v.kcal.active) ? v.kcal.active : isNum(d.activeKcal) ? d.activeKcal : null;
+      const hasAct = isNum(d.activeKcal) || isNum(d.steps) || isNum(d.totalKcal);
+      if (isNum(act) && act >= 0 && hasAct) S.active[k] = act;
+      if (isNum(v.strain) && (isNum(d.steps) || (Array.isArray(d.hr) && d.hr.length) || (Array.isArray(d.workouts) && d.workouts.length))) {
+        const s = sp(v.strain, v);
+        if (isNum(s)) S.strain[k] = s;
+      }
+    }
+    // training load: fitness (CTL) and fatigue (ATL)
+    if (typeof A.load === "function" && N) {
+      try {
+        const L = A.load(days, derived);
+        const at = new Map(L.map((x) => [x.date, x]));
+        let any = false;
+        for (let k = 0; k < N; k++) {
+          const x = at.get(days[k].date);
+          if (!x) continue;
+          if (!x.noData) any = true;
+          if (!any) continue; // nothing recorded yet: the model would only show its seed
+          if (isNum(x.ctl)) S.fitness[k] = x.ctl;
+          if (isNum(x.atl)) S.fatigue[k] = x.atl;
+        }
+      } catch (e) {}
+    }
+    const model = { days, derived, series: S, profile: p, cardio: null, bio: { from: null }, height, lazyFrom: N };
+    // the slow parts (cardio fitness ≈ 60–100 ms and sleep debt for every day on a year of data) are first worked out
+    // for the recent window only: the tiles, sparklines and Home pins need ≤ 8 weeks; detail() fills in the rest
+    lazyFill(model, Math.max(0, N - RECENT));
+    // biological age: the latest estimate + its 12 weekly points
+    if (typeof E.bioAge === "function" && N) {
+      try {
+        const end = latestIdx(days, opts && opts.today);
+        if (end >= 0) bioFill(model, end);
+      } catch (e) {}
+    }
+    cache.set(days, { der: derived, pk, model });
+    return model;
+  }
+  const RECENT = 70; // days computed up front (tiles look back ≤ 56 days)
+  /* fill sleep debt + cardio (VO2max per day, heart-rate drop per workout day) for days from index `from` on */
+  function lazyFill(model, from) {
+    if (from >= model.lazyFrom) return;
+    const A = root.CadenceAnalytics || {};
+    const { days, derived, series: S, profile: p } = model;
+    const to = model.lazyFrom; // exclusive: days ≥ lazyFrom are done
+    if (typeof A.sleepDebt === "function") {
+      for (let k = from; k < to; k++) {
+        if (!isNum(S.sleep[k])) continue;
+        try {
+          const r = A.sleepDebt(days, derived, k);
+          if (r && r.status === "ok" && isNum(r.hours)) S.debt[k] = r.hours;
+        } catch (e) {}
+      }
+    }
+    if (typeof A.cardio === "function") {
+      try {
+        // a run's VO2max uses the 28-day resting-HR median of its day, and each day blends the runs of the 28 days
+        // before it: 60 days of warm-up make the kept values identical to a run over the whole history
+        const start = Math.max(0, from - 60);
+        const c = A.cardio(from > 0 ? days.slice(start) : days, from > 0 ? derived.slice(start) : derived, p);
+        if (to === days.length) model.cardio = c;
+        const at = new Map();
+        for (let k = from; k < to; k++) at.set(days[k].date, k);
+        for (const t of c.trend || []) {
+          const k = at.get(t.date);
+          if (k != null && isNum(t.vo2)) S.vo2[k] = t.vo2;
+        }
+        const per = new Map();
+        for (const w of c.workouts || []) {
+          if (!isNum(w.hrr60) || w.hrrAbnormal === null || w.hrrAbnormal === undefined) continue;
+          const k = at.get(w.date);
+          if (k == null) continue;
+          if (!per.has(k)) per.set(k, []);
+          per.get(k).push(w.hrr60);
+        }
+        for (const [k, v] of per) S.hrr60[k] = median(v);
+      } catch (e) {}
+    }
+    model.lazyFrom = from;
+  }
+  /* bioAge at index j adds that day + up to 12 weekly points before it */
+  function bioFill(model, j) {
+    const E = root.CadenceEngine;
+    const b = E.bioAge(model.days, model.derived, model.profile, j);
+    model.bio.calls = (model.bio.calls || 0) + 1;
+    const first = b && Array.isArray(b.history) && b.history.length ? b.history[0].date : model.days[j].date;
+    if (b) {
+      if (!model.bio.latest || model.days[j].date > model.bio.latest.date) model.bio.latest = { date: model.days[j].date, age: b.age, chronological: b.chronological, delta: b.delta, pace: b.pace, paceLabel: b.paceLabel, confidence: b.confidence };
+      const at = new Map();
+      model.days.forEach((d, k) => { if (d.date >= first && d.date <= model.days[j].date) at.set(d.date, k); });
+      for (const h of b.history || []) {
+        const k = at.get(h.date);
+        if (k != null && isNum(h.age)) model.series.bioage[k] = h.age;
+      }
+    }
+    model.bio.from = model.bio.from && model.bio.from < first ? model.bio.from : first;
+    return b;
+  }
+  /* make sure weekly bio-age points reach back to `from` (each call covers ~12 weeks) */
+  function bioBackfill(model, from) {
+    const E = root.CadenceEngine;
+    if (!E || typeof E.bioAge !== "function" || !model.days.length || !model.bio.from) return;
+    let guard = 0;
+    while (model.bio.from > from && model.bio.from > model.days[0].date && guard++ < 12) {
+      const target = addD(model.bio.from, -7);
+      let j = lowerIdx(model.days, target);
+      if (j >= model.days.length || model.days[j].date > target) j--;
+      if (j < 0) break;
+      const before = model.bio.from;
+      try { bioFill(model, j); } catch (e) { break; }
+      if (model.bio.from >= before) model.bio.from = model.days[j].date; // nothing earlier came back
+      if (model.days[j].date <= model.days[0].date) break;
+    }
+  }
+
+  /* ---------------- one tile's numbers ---------------- */
+  /** tile(model, key, end, today) → {key, has, value, valueDate, change:{diff, base, tone, dir, label}|null, spark:[], note} */
+  function tile(model, key, end, today) {
+    const m = DEF[key];
+    const days = model.days, vals = model.series[key];
+    const out = { key, has: false, value: null, valueDate: null, change: null, spark: [], note: m.valueNote || "7-day average", ever: false };
+    if (!m || !vals || end < 0 || end >= days.length) return out;
+    const endDate = days[end].date;
+    // today is still running for day-total metrics: use full days only (unless today is all there is)
+    let to = endDate;
+    if (m.partial && today && endDate >= today) to = addD(today, -1);
+    for (let k = 0; k <= end; k++) if (isNum(vals[k])) { out.ever = true; break; }
+    let pts;
+    if (m.agg === "latest") {
+      pts = between(days, vals, addD(to, -30), to);
+      if (pts.length) { const L = pts[pts.length - 1]; out.value = L.v; out.valueDate = L.date; }
+    } else if (m.agg === "med28") {
+      pts = between(days, vals, addD(to, -27), to);
+      if (pts.length) { out.value = median(pts.map((x) => x.v)); out.valueDate = pts[pts.length - 1].date; }
+    } else {
+      pts = between(days, vals, addD(to, -6), to);
+      if (pts.length) { out.value = mean(pts.map((x) => x.v)); out.valueDate = pts[pts.length - 1].date; out.n = pts.length; }
+      else {
+        // nothing this week: the latest reading of the last 30 days
+        const old = between(days, vals, addD(to, -30), to);
+        if (old.length) { const L = old[old.length - 1]; out.value = L.v; out.valueDate = L.date; out.note = "Latest reading"; }
+      }
+    }
+    out.has = isNum(out.value);
+    if (!out.has) return out;
+    // change
+    let base = null, label = "vs 30-day avg";
+    if (m.change === "prev28") {
+      const prev = between(days, vals, addD(to, -55), addD(to, -28));
+      if (prev.length >= 2 && pts.length >= 2) base = median(prev.map((x) => x.v));
+      label = "vs previous 4 weeks";
+    } else if (m.change === "ago28") {
+      const prev = between(days, vals, addD(to, -42), addD(to, -21));
+      if (prev.length) base = prev[prev.length - 1 - Math.floor((prev.length - 1) / 2)].v;
+      label = "vs 4 weeks ago";
+    } else {
+      const win = between(days, vals, addD(to, -29), to);
+      const need = m.sparse ? 3 : 10;
+      if (win.length >= need) base = mean(win.map((x) => x.v));
+    }
+    if (isNum(base)) {
+      const diff = out.value - base;
+      const dir = Math.abs(diff) < (m.eps || 0) ? "flat" : diff > 0 ? "up" : "down";
+      const tone = dir === "flat" || !m.good ? "neutral" : dir === m.good ? "good" : "bad";
+      out.change = { diff, base, dir, tone, label };
+    }
+    // sparkline: last 30 days (bio age: last 12 weeks of weekly points)
+    const from = key === "bioage" ? addD(endDate, -84) : addD(endDate, -29);
+    const sp = between(days, vals, from, endDate);
+    out.spark = sp.map((x) => x.v);
+    return out;
+  }
+
+  /* ---------------- detail for a range ---------------- */
+  const RANGES = [
+    ["1m", "1M", 30, "1 month"],
+    ["3m", "3M", 91, "3 months"],
+    ["6m", "6M", 182, "6 months"],
+    ["1y", "1Y", 365, "1 year"],
+    ["all", "All", null, "all time"],
+  ];
+  const RANGE = {};
+  for (const r of RANGES) RANGE[r[0]] = { key: r[0], label: r[1], days: r[2], name: r[3] };
+  function spanText(days) {
+    if (days < 10) return `${days + 1} days`;
+    if (days < 45) return `${Math.max(1, Math.round(days / 7))} weeks`;
+    if (days < 330) { const mo = Math.round(days / 30.4); return mo === 1 ? "a month" : `${mo} months`; }
+    const y = Math.round(days / 365);
+    return y <= 1 ? "a year" : `${y} years`;
+  }
+  /** detail(model, key, end, rangeKey) → {pts, chart:[{label,v}], weekly, band, avg, best, worst, trend, n, from, to} */
+  function detail(model, key, end, rangeKey) {
+    const m = DEF[key];
+    const days = model.days, vals = model.series[key];
+    const rg = RANGE[rangeKey] || RANGE["3m"];
+    const out = { key, range: rg.key, pts: [], chart: [], weekly: false, band: null, avg: null, best: null, worst: null, trend: null, n: 0 };
+    if (!m || end < 0 || !days.length) return out;
+    const to = days[end].date;
+    let from = rg.days ? addD(to, -(rg.days - 1)) : days[0].date;
+    if (key === "bioage") bioBackfill(model, from);
+    if ((key === "vo2" || key === "hrr60" || key === "debt") && model.lazyFrom > 0) {
+      const need = rg.days ? lowerIdx(days, from) : 0;
+      if (need < model.lazyFrom) lazyFill(model, need);
+    }
+    const pts = between(days, vals, from, to);
+    out.pts = pts;
+    out.n = pts.length;
+    if (!pts.length) return out;
+    if (!rg.days || from < pts[0].date) from = pts[0].date; // start the chart at the first reading
+    out.from = from;
+    out.to = to;
+    const vs = pts.map((x) => x.v);
+    out.avg = mean(vs);
+    const sorted = vs.slice().sort((a, b) => a - b);
+    if (vs.length >= 5) out.band = [quantile(sorted, 0.25), quantile(sorted, 0.75)];
+    let hi = pts[0], lo = pts[0];
+    for (const x of pts) { if (x.v > hi.v) hi = x; if (x.v < lo.v) lo = x; }
+    if (pts.length >= 2) {
+      if (m.good === "down") { out.best = lo; out.worst = hi; }
+      else { out.best = hi; out.worst = lo; }
+    }
+    // trend: first week vs last week of the range (sparse series: first vs last reading)
+    const span = diffD(pts[0].date, pts[pts.length - 1].date);
+    if (pts.length >= 2 && span >= 6) {
+      let a, b;
+      const dense = pts.length >= 8 && pts.length / (span + 1) >= 0.4;
+      if (dense) {
+        const w = Math.max(3, Math.min(7, Math.round((span + 1) / 6)));
+        a = mean(pts.filter((x) => diffD(pts[0].date, x.date) < w).map((x) => x.v));
+        b = mean(pts.filter((x) => diffD(x.date, pts[pts.length - 1].date) < w).map((x) => x.v));
+      } else { a = pts[0].v; b = pts[pts.length - 1].v; }
+      const diff = b - a;
+      const dir = Math.abs(diff) < (m.eps || 0) ? "flat" : diff > 0 ? "up" : "down";
+      const tone = dir === "flat" || !m.good ? "neutral" : dir === m.good ? "good" : "bad";
+      const over = `over ${spanText(span)}`;
+      const u = unitD(m);
+      const amount = `${fmtDiff(m, diff)}${u ? (u === "%" || u === "/min" || u === "°C" ? "" : " ") + u : ""}`;
+      const text = dir === "flat" ? `Steady ${over}` : `${dir === "up" ? "Up" : "Down"} ${amount} ${over}`;
+      out.trend = { diff, dir, tone, text, from: a, to: b };
+    }
+    // chart points: daily for up to ~3 months, weekly averages beyond
+    const total = diffD(from, to) + 1;
+    const dense = pts.length / total >= 0.5;
+    if (total > 100) {
+      out.weekly = true;
+      const wk = new Map();
+      for (const x of pts) {
+        const w = Math.floor(diffD(from, x.date) / 7);
+        if (!wk.has(w)) wk.set(w, []);
+        wk.get(w).push(x.v);
+      }
+      const nW = Math.floor((total - 1) / 7) + 1;
+      for (let w = 0; w < nW; w++) {
+        const a = wk.get(w);
+        if (!dense && !a) continue;
+        out.chart.push({ label: shortD(addD(from, w * 7)), v: a ? mean(a) : null, date: addD(from, w * 7) });
+      }
+    } else if (dense) {
+      const at = new Map(pts.map((x) => [x.date, x.v]));
+      for (let i = 0; i < total; i++) {
+        const dt = addD(from, i);
+        out.chart.push({ label: shortD(dt), v: at.has(dt) ? at.get(dt) : null, date: dt });
+      }
+    } else {
+      for (const x of pts) out.chart.push({ label: shortD(x.date), v: x.v, date: x.date });
+    }
+    return out;
+  }
+
+  /* ---------------- general guides ---------------- */
+  /** norm(model, key, value) → {text, source} | null */
+  function norm(model, key, value) {
+    const p = model.profile || {};
+    const A = root.CadenceAnalytics || {};
+    if (!isNum(value)) return null;
+    if (key === "vo2" && typeof A.vo2Norm === "function") {
+      const n = A.vo2Norm(value, p.age, p.sex);
+      if (!n) return null;
+      const who = n.sex === "female" ? "women" : n.sex === "male" ? "men" : "adults";
+      return { text: `${n.category.charAt(0).toUpperCase() + n.category.slice(1)} for ${who} aged ${n.ageGroup}: ${n.text}. The middle value for that group is ${numTxt(n.median, 1)}.`, source: "General guide: FRIEND registry (Kaminsky et al. 2015), as used by the ACSM." };
+    }
+    if (key === "rhr") {
+      const where = value < 60 ? "Yours is under 60, which is common in people who train regularly." : value <= 100 ? "Yours sits inside that range." : "Yours is above that range; talk to a doctor if it stays there or you feel unwell.";
+      return { text: `Most adults rest between 60 and 100 bpm, and regular exercisers often sit at 40–60. ${where}`, source: "General guide: American Heart Association." };
+    }
+    if (key === "hrv") return { text: "HRV differs a lot from person to person and falls with age, so compare it with your own normal rather than with other people.", source: null };
+    if (key === "bioage") {
+      const b = model.bio && model.bio.latest;
+      if (!b || !isNum(b.chronological)) return null;
+      const d = value - b.chronological;
+      const rel = Math.abs(d) < 0.5 ? "about the same as" : `${numTxt(Math.abs(d), 1)} years ${d < 0 ? "younger than" : "older than"}`;
+      return { text: `Your calendar age is ${numTxt(b.chronological, 1)}, so your body reads ${rel} your age.${b.paceLabel ? ` Pace: ${b.paceLabel.toLowerCase()}.` : ""}`, source: "An estimate from wearable data, not a medical test." };
+    }
+    if (key === "recovery") return { text: "Green is 67–100 %, yellow 34–66 % and red 0–33 %. A few red days in a row are worth an easier week.", source: "Cadence's recovery bands." };
+    if (key === "sleep") return { text: "Adults need 7–9 hours of sleep a night. Under 7 hours most nights is linked with poorer health and recovery.", source: "General guide: American Academy of Sleep Medicine." };
+    if (key === "hrr60") return { text: "In studies, a drop of 12 bpm or less in the first minute is linked with higher risk; fit people often drop 20–40 bpm. Real workouts usually end with a cool-down, so this reads lower than a lab test.", source: "General guide: Cole et al. 1999." };
+    if (key === "fitness" || key === "fatigue") {
+      const k = model.days.length - 1;
+      const f = model.series.fitness[k], g = model.series.fatigue[k];
+      const form = isNum(f) && isNum(g) ? f - g : null;
+      const word = !isNum(form) ? "" : form > 5 ? " Right now fitness is above fatigue: you are fresh." : form < -10 ? " Right now fatigue is well above fitness: you are carrying a lot of recent training." : " Right now the two are close: a balanced load.";
+      return { text: `Fitness is your six-week training average and fatigue your one-week average. Fitness above fatigue means you are fresh; fatigue far above fitness means a heavy block.${word}`, source: null };
+    }
+    if (key === "consistency") return { text: "Above 80 % means very regular sleep times; under 70 % means your bed and wake times move around a lot.", source: "Cadence guide." };
+    if (key === "debt") return { text: "Under 1.5 hours is low, 1.5–3 hours moderate and over 3 hours high. A few longer nights pay it back.", source: "Cadence guide." };
+    if (key === "resp") return { text: "Adults usually breathe 12–20 times a minute at rest and a little slower in sleep. Your own trend matters more than the number.", source: "General guide." };
+    if (key === "spo2") return { text: "Most healthy adults read 95–100 %. Wrist readings can run a little low. Talk to a doctor if you feel unwell or short of breath.", source: "General guide." };
+    if (key === "temp") return { text: "Night-to-night changes within ±0.5 °C are normal. A rise for a few nights in a row can come with illness, alcohol or a warm room.", source: "General guide." };
+    if (key === "bmi") {
+      const cat = value < 18.5 ? "underweight" : value < 25 ? "healthy" : value < 30 ? "overweight" : "obese";
+      return { text: `Adult ranges: under 18.5 underweight, 18.5–24.9 healthy, 25–29.9 overweight, 30 and over obese. Yours is in the ${cat} range. BMI can't tell muscle from fat.`, source: "General guide: World Health Organization." };
+    }
+    if (key === "steps") return { text: "For adults under 60 the benefits level off around 8,000–10,000 steps a day; over 60, around 6,000–8,000.", source: "General guide: Paluch et al. 2022." };
+    if (key === "strain") return { text: "100 % means you reached the most strain your recovery called for that day. Days well over 100 % add fatigue.", source: null };
+    return null;
+  }
+
+  const api = { DEF, M, SECTIONS, RANGES, build, tile, detail, norm, fmtV, fmtDiff, spanText, latestIdx, bioBackfill, lazyFill, _cache: cache };
+  root.CadenceMetrics = api;
+  if (typeof module !== "undefined" && module.exports) module.exports = api;
+
+  /* ======================================================================
+   * UI (browser only)
+   * ====================================================================== */
+  const App = root.App;
+  const Views = root.Views || (typeof window !== "undefined" ? (window.Views = window.Views || {}) : null);
+  if (!App || !Views || typeof document === "undefined") return;
+
+  const esc = (s) => App.esc(s == null ? "" : String(s));
+  const C = () => root.Charts || {};
+  /* icons: icons.js MAP names first, then the charts.js set; missing names draw a small dot */
+  const ic = (n, px, sw) => {
+    try {
+      const s = (C().icon && C().icon(n, px || 18, sw)) || "";
+      if (s) return s;
+    } catch (e) {}
+    return `<svg width="${px || 18}" height="${px || 18}" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4" fill="currentColor"/></svg>`;
+  };
+  const ICON_FALLBACK = { trend: "performance", wind: "activity", thermo: "flame", gauge: "strain", "battery-charging": "recovery" };
+  const mIcon = (m, px) => {
+    let s = "";
+    try { s = (C().icon && C().icon(m.icon, px, 2)) || ""; } catch (e) {}
+    if (!s && ICON_FALLBACK[m.icon]) try { s = (C().icon && C().icon(ICON_FALLBACK[m.icon], px, 2)) || ""; } catch (e) {}
+    return s || ic("dot", px, 2);
+  };
+  const DOC = "metrics";
+  const pins = () => {
+    const d = App.docGet(DOC);
+    const p = d && Array.isArray(d.pins) ? d.pins : [];
+    return p.filter((k, i) => DEF[k] && p.indexOf(k) === i);
+  };
+  const ST = { sel: undefined, range: "3m", pushed: null, scroll: 0, toTop: false };
+  const todayStr = () => (App.todayStr ? App.todayStr() : null);
+  const modelOf = (ctx) => build(ctx.days, ctx.derived, ctx.profile || (App.profile && App.profile()), { today: todayStr(), strainPct: App.strainPct });
+  const hashKey = () => {
+    try {
+      const h = String(root.location.hash || "");
+      const m = h.match(/^#\/?metrics(?:[/?&]([a-z0-9]+))?/);
+      if (!m) return undefined;
+      return m[1] && DEF[m[1]] ? m[1] : null;
+    } catch (e) {
+      return undefined;
+    }
+  };
+  const setHash = (key, push) => {
+    try {
+      const want = "#metrics" + (key ? "/" + key : "");
+      if (root.location.hash === want) return true;
+      if (push) root.location.hash = want.slice(1);
+      else if (root.history && root.history.replaceState) root.history.replaceState(null, "", want);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  };
+
+  const arrowSvg = (dir) =>
+    dir === "flat"
+      ? `<svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><rect x="1" y="4.2" width="8" height="1.6" rx=".8" fill="currentColor"/></svg>`
+      : `<svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="${dir === "up" ? "M5 1.2 9 7.4H1z" : "M5 8.8 1 2.6h8z"}" fill="currentColor"/></svg>`;
+  function changeHtml(m, t, compact) {
+    if (!t.change) return `<span class="mx-ch none">${t.ever ? (compact ? "Building history" : "Not enough history yet") : ""}</span>`;
+    const c = t.change, u = unitD(m);
+    const uu = compact && u && u.length > 4 ? "" : u;
+    const amt = c.dir === "flat" ? (compact ? "Steady" : "Same as usual") : `${fmtDiff(m, c.diff)}${uu ? (uu === "%" || uu === "/min" || uu === "°C" ? "" : " ") + uu : ""}`;
+    const sr = c.dir === "flat" ? "about the same as" : `${c.dir === "up" ? "up" : "down"} ${amt}`;
+    return `<span class="mx-ch ${c.tone}"><span class="mx-ar">${arrowSvg(c.dir)}</span><span class="mx-cv">${esc(amt)}</span>${compact ? "" : `<span class="mx-cl">${esc(c.label)}</span>`}<span class="sr-only">, ${esc(sr)} ${esc(c.label)}</span></span>`;
+  }
+  const valHtml = (m, v, big, tight) => {
+    const t = fmtV(m, v);
+    return `<span class="mx-v${big ? " big" : ""}"><span class="ui-num">${esc(t)}</span>${m.unit && isNum(v) && !(tight && m.unit.length > 4) ? `<span class="mx-u">${esc(m.unit)}</span>` : ""}</span>`;
+  };
+  function tileHtml(m, t, pinned) {
+    const spark = t.spark.length >= 2 && C().sparkline ? C().sparkline({ data: t.spark, color: m.color, w: 150, h: 30 }) : `<span class="mx-sp-none" aria-hidden="true"></span>`;
+    const aria = `${m.label}: ${t.has ? fmtV(m, t.value) + (m.unit ? " " + m.unit : "") : "no recent data"}. Open details`;
+    return `<button type="button" class="mx-tile${t.has ? "" : " empty"}" data-action="mx-open" data-key="${m.key}" style="--c:${m.color}" aria-label="${esc(aria)}">
+      <span class="mx-th"><span class="mx-ti" aria-hidden="true">${mIcon(m, 14)}</span><span class="mx-tl">${esc(m.short || m.label)}</span>${pinned ? `<span class="mx-pin-on" title="Pinned to Home" aria-hidden="true">${pinSvg(true, 12)}</span>` : ""}</span>
+      ${t.has ? valHtml(m, t.value) : `<span class="mx-v"><span class="ui-num">${DASH}</span></span>`}
+      ${t.has ? changeHtml(m, t, true) : `<span class="mx-ch none">No recent data</span>`}
+      <span class="mx-sp">${spark}</span>
+    </button>`;
+  }
+  const pinSvg = (on, px) =>
+    `<svg width="${px || 18}" height="${px || 18}" viewBox="0 0 24 24" fill="${on ? "currentColor" : "none"}" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></svg>`;
+
+  const head = (sub) => `<header class="page-head"><h1>Key metrics</h1><p class="sub">${esc(sub)}</p></header>`;
+  function emptyPage() {
+    return `<div class="page one-col v-metrics mx">${head("Your most important numbers and how they're moving.")}
+      <section class="card mx-empty">
+        <div class="mx-empty-art" aria-hidden="true">${[["var(--optimal)", "M2 30 L14 22 L24 26 L36 12 L48 16 L58 6"], ["var(--hrv)", "M2 24 L14 26 L24 14 L36 18 L48 10 L58 12"], ["var(--sleep)", "M2 18 L14 12 L24 20 L36 16 L48 22 L58 14"]].map(([c, d]) => `<svg viewBox="0 0 60 36" width="60" height="36"><path d="${d}" fill="none" stroke="${c}" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`).join("")}</div>
+        <h2 class="mx-empty-t">No metrics yet</h2>
+        <p class="mx-note">Connect your tracker or import data, and VO₂ max, resting heart rate, HRV, sleep and more show up here with their history.</p>
+        <button type="button" class="btn primary" data-action="core-go" data-view="data">Connect data</button>
+      </section></div>`;
+  }
+
+  function gridHtml(ctx, model, end) {
+    const today = todayStr();
+    const pinned = new Set(pins());
+    let html = "";
+    let shown = 0;
+    for (const [sec, title] of SECTIONS) {
+      const tiles = [];
+      for (const m of M.filter((x) => x.sec === sec)) {
+        const t = tile(model, m.key, end, today);
+        if (!t.ever && (m.hideEmpty || !t.has)) continue; // never measured: leave it out
+        tiles.push(tileHtml(m, t, pinned.has(m.key)));
+      }
+      if (!tiles.length) continue;
+      shown += tiles.length;
+      html += C().section
+        ? C().section({ title, cls: "mx-sec", body: `<div class="mx-grid">${tiles.join("")}</div>` })
+        : `<section class="mx-sec"><h2>${esc(title)}</h2><div class="mx-grid">${tiles.join("")}</div></section>`;
+    }
+    if (!shown) return null;
+    const last = ctx.days[end].date;
+    const sub = `Tap any number for its history. Data through ${longD(last)}.`;
+    return `<div class="page one-col v-metrics mx">${head(sub)}${html}<p class="mx-foot">Averages use your last 7 days and compare with your 30-day average. Arrows are green when the change is good for you and red when it isn't.</p></div>`;
+  }
+
+  function detailHtml(ctx, model, end, key) {
+    const m = DEF[key];
+    const t = tile(model, key, end, todayStr());
+    const det = detail(model, key, end, ST.range);
+    const isPinned = pins().includes(key);
+    const rg = RANGE[det.range];
+    const top = `<div class="mx-dtop"><button type="button" class="btn ghost small mx-back" data-action="mx-close">${ic("chevL", 18, 2.2) || "‹"}All metrics</button>
+      <button type="button" class="btn small mx-pinb${isPinned ? " on" : ""}" data-action="mx-pin" data-key="${key}" aria-pressed="${isPinned}">${pinSvg(isPinned, 16)}${isPinned ? "Pinned" : "Pin to Home"}</button></div>`;
+    const hero = `<section class="card mx-hero" style="--c:${m.color}">
+      <div class="mx-hh"><span class="mx-hi" aria-hidden="true">${mIcon(m, 20)}</span><h2 class="mx-ht">${esc(m.label)}</h2></div>
+      ${t.has ? valHtml(m, t.value, true) : `<span class="mx-v big"><span class="ui-num">${DASH}</span></span>`}
+      <p class="mx-hs">${esc(t.has ? `${t.note}${t.valueDate ? " · " + longD(t.valueDate) : ""}` : "No reading in the last 30 days")}</p>
+      ${t.has ? changeHtml(m, t, false) : ""}
+    </section>`;
+    const seg = `<div class="seg mx-seg" role="tablist" aria-label="Range">${RANGES.map(([k, l, , name]) => `<button type="button" role="tab" class="${k === det.range ? "on" : ""}" aria-selected="${k === det.range}" aria-label="${esc(name)}" data-action="mx-range" data-k="${k}">${l}</button>`).join("")}</div>`;
+    const u = m.unit ? " " + m.unit : "";
+    let chartCard;
+    if (det.chart.length && det.n) {
+      const spec = { type: "line", data: det.chart.map((p) => ({ label: p.label, v: isNum(p.v) ? +p.v.toFixed(3) : null })), color: m.color, height: 200, band: det.band || undefined, fmt: (v) => fmtV(m, v), label: `${m.label}, ${rg.name}` };
+      const bandTxt = det.band ? `<p class="mx-band"><span class="mx-bsw" aria-hidden="true"></span>Your normal: ${esc(fmtV(m, det.band[0]))}–${esc(fmtV(m, det.band[1]))}${esc(u)} (the middle half of your days in this range)</p>` : "";
+      chartCard = `<section class="card mx-chart" style="--c:${m.color}"><div class="card-head"><h2>${esc(m.label)}</h2><span class="card-meta">${esc(rg.key === "all" ? "All time" : rg.name.charAt(0).toUpperCase() + rg.name.slice(1))}${det.weekly ? " · weekly" : ""}</span></div>
+        ${C().slot ? C().slot(spec) : ""}${bandTxt}</section>`;
+    } else {
+      chartCard = `<section class="card mx-chart"><div class="card-head"><h2>${esc(m.label)}</h2><span class="card-meta">${esc(rg.name)}</span></div><p class="mx-note">No readings in this range. Try a longer range.</p></section>`;
+    }
+    const stat = (l, v, s, tone) => `<div class="mx-st"><span class="mx-stl">${esc(l)}</span><span class="mx-stv${tone ? " " + tone : ""}"><span class="ui-num">${esc(v)}</span>${v !== DASH && m.unit && m.unit.length <= 4 ? `<span class="mx-u">${esc(m.unit)}</span>` : ""}</span>${s ? `<span class="mx-sts">${esc(s)}</span>` : ""}</div>`;
+    const hiL = m.good ? "Best" : "Highest", loL = m.good ? "Worst" : "Lowest";
+    const bestP = m.good ? det.best : det.best && det.worst ? (det.best.v >= det.worst.v ? det.best : det.worst) : null;
+    const worstP = m.good ? det.worst : det.best && det.worst ? (det.best.v >= det.worst.v ? det.worst : det.best) : null;
+    const stats = det.n
+      ? `<section class="card mx-stats"><div class="card-head"><h2>${esc(rg.key === "all" ? "All time" : "Last " + rg.name)}</h2><span class="card-meta">${m.unit && m.unit.length > 4 ? esc(m.unit) + " · " : ""}${det.n} ${det.n === 1 ? "reading" : key === "bioage" ? "weekly estimates" : key === "hrr60" ? "workout days" : "days"}</span></div>
+        <div class="mx-sts-g">${stat("Average", fmtV(m, det.avg))}${stat(hiL, bestP ? fmtV(m, bestP.v) : DASH, bestP ? shortD(bestP.date) : "", m.good ? "good" : "")}${stat(loL, worstP ? fmtV(m, worstP.v) : DASH, worstP ? shortD(worstP.date) : "", m.good ? "bad" : "")}</div>
+        ${det.trend ? `<p class="mx-trend ${det.trend.tone}"><span class="mx-ar">${arrowSvg(det.trend.dir)}</span>${esc(det.trend.text)}${det.trend.tone === "good" ? ": heading the right way." : det.trend.tone === "bad" ? ": worth keeping an eye on." : "."}</p>` : det.n < 2 ? `<p class="mx-note">More readings are needed to show a trend.</p>` : ""}
+      </section>`
+      : "";
+    const nm = norm(model, key, t.has ? t.value : det.avg);
+    const guide = nm ? `<section class="card mx-guide"><div class="card-head"><h2>How it compares</h2></div><p class="mx-gt">${esc(nm.text)}</p>${nm.source ? `<p class="mx-gs">${esc(nm.source)}</p>` : ""}</section>` : "";
+    const about = `<section class="card mx-about"><div class="card-head"><h2>About ${esc(m.short || m.label)}</h2></div><p class="mx-gt">${esc(m.about)}</p><p class="mx-gs">Estimates from wearable data, for spotting trends. Not medical advice.</p></section>`;
+    return `<div class="page one-col v-metrics mx mx-d" data-key="${key}">${top}${hero}${seg}${chartCard}${stats}${guide}${about}</div>`;
+  }
+
+  Views.metrics = {
+    label: "Key metrics",
+    icon: "activity",
+    dated: false,
+    render(ctx) {
+      const t0 = typeof performance !== "undefined" ? performance.now() : 0;
+      if (ST.sel === undefined) {
+        const h = hashKey();
+        ST.sel = h || null;
+      }
+      const days = (ctx && ctx.days) || [];
+      const end = latestIdx(days, todayStr());
+      if (!days.length || end < 0) return emptyPage();
+      const model = modelOf(ctx);
+      let html = null;
+      if (ST.sel && DEF[ST.sel]) html = detailHtml(ctx, model, end, ST.sel);
+      if (!html) html = gridHtml(ctx, model, end);
+      if (!html) html = emptyPage();
+      if (t0) api.lastRenderMs = performance.now() - t0;
+      return html;
+    },
+    after(el) {
+      try {
+        if (ST.toTop) { ST.toTop = false; root.scrollTo(0, 0); }
+        else if (ST.restore != null) { const y = ST.restore; ST.restore = null; root.scrollTo(0, y); }
+      } catch (e) {}
+    },
+    css: `
+.mx .mx-sec .ui-sec-b{margin-top:2px}
+.mx-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.mx-grid > :last-child:nth-child(odd){grid-column:1/-1}
+@container view (min-width:620px){.mx-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.mx-grid > :last-child:nth-child(odd){grid-column:auto}}
+@media (min-width:900px){.mx-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.mx-grid > :last-child:nth-child(odd){grid-column:auto}}
+.mx-tile{position:relative;display:flex;flex-direction:column;align-items:stretch;gap:4px;min-width:0;min-height:132px;padding:12px 12px 10px;border:0;border-radius:16px;text-align:left;font:inherit;color:var(--foreground);background:linear-gradient(180deg,var(--card-top),var(--card));box-shadow:var(--card-hi);cursor:pointer;overflow:hidden;transition:transform var(--dur-fast) var(--ease-standard)}
+.mx-tile:hover{background:linear-gradient(180deg,var(--card-top-hover,var(--card-hover)),var(--card-hover))}
+.mx-tile:active{transform:scale(.98)}
+.mx-tile:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.mx-th{display:flex;align-items:center;gap:6px;min-width:0}
+.mx-ti{flex:none;display:grid;place-items:center;width:22px;height:22px;border-radius:7px;color:var(--c);background:color-mix(in srgb,var(--c) 16%,transparent)}
+.mx-ti svg{width:14px;height:14px}
+.mx-tl{font-size:11px;line-height:14px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--foreground-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.mx-pin-on{margin-left:auto;flex:none;color:var(--muted);display:grid}
+.mx-v{display:flex;align-items:baseline;gap:4px;min-width:0;margin-top:4px;line-height:1.05;white-space:nowrap}
+.mx-v .ui-num{font-family:var(--f-num);font-size:26px;font-weight:600;letter-spacing:-.01em;font-variant-numeric:tabular-nums;color:var(--foreground)}
+.mx-v.big .ui-num{font-size:46px;font-weight:600}
+.mx-u{font-size:12.5px;font-weight:600;color:var(--foreground-secondary);overflow:hidden;text-overflow:ellipsis}
+.mx-v.big .mx-u{font-size:15px}
+.mx-ch{display:flex;align-items:center;gap:4px;min-width:0;font-size:12px;font-weight:600;color:var(--muted);white-space:nowrap;overflow:hidden}
+.mx-ch.none{font-weight:500;min-height:16px}
+.mx-ch.good{color:var(--optimal-text,var(--optimal))}
+.mx-ch.bad{color:var(--red-text)}
+.mx-ch.neutral{color:var(--foreground-secondary)}
+.mx-ar{display:grid;place-items:center;flex:none}
+.mx-cl{color:var(--muted);font-weight:500;margin-left:2px;overflow:hidden;text-overflow:ellipsis}
+.mx-sp{display:block;margin-top:auto;padding-top:6px;height:36px}
+.mx-sp .ui-spark{display:block;width:100%;height:30px}
+.mx-sp-none{display:block;height:30px;border-bottom:1px dashed var(--border)}
+.mx-tile.empty .mx-v .ui-num{color:var(--muted)}
+.mx-foot{font-size:12px;color:var(--muted);line-height:1.45;padding:0 4px}
+.mx .mx-note{font-size:var(--fs-s);color:var(--muted);line-height:1.45}
+.mx-empty{text-align:center;display:flex;flex-direction:column;align-items:center;gap:10px;padding:28px 20px}
+.mx-empty > * + *{margin-top:0}
+.mx-empty-art{display:flex;gap:10px;justify-content:center;margin-bottom:4px}
+.mx-empty-art svg{padding:8px;border-radius:12px;background:var(--inset);width:76px;height:52px;box-sizing:border-box}
+.mx-empty-t{font-size:18px;font-weight:600}
+.mx-empty .mx-note{max-width:34ch}
+.mx-dtop{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.mx .mx-back{padding-left:6px;min-height:44px}
+.mx-back svg{width:18px;height:18px}
+.mx .mx-pinb{min-height:44px;gap:6px}
+.mx-pinb.on{color:var(--accent);background:var(--accent-soft)}
+.mx-hero{display:flex;flex-direction:column;gap:6px}
+.mx-hero > * + *{margin-top:0}
+.mx-hh{display:flex;align-items:center;gap:10px;min-width:0}
+.mx-hi{flex:none;display:grid;place-items:center;width:34px;height:34px;border-radius:10px;color:var(--c);background:color-mix(in srgb,var(--c) 16%,transparent)}
+.mx-ht{font-size:13px;line-height:16px;font-weight:700;letter-spacing:var(--track-caps);text-transform:uppercase;color:var(--foreground);margin:0;min-width:0}
+.mx-hs{font-size:13px;color:var(--muted)}
+.mx-hero .mx-ch{font-size:13px;white-space:normal}
+.mx-seg{display:flex;width:100%}
+.mx .mx-seg button{flex:1 1 0;min-height:44px;padding:0 6px}
+.mx-band{display:flex;align-items:flex-start;gap:8px;font-size:12px;color:var(--muted);line-height:1.4}
+.mx-bsw{flex:none;width:14px;height:10px;margin-top:2px;border-radius:3px;border-top:1px dashed var(--c,var(--foreground-secondary));border-bottom:1px dashed var(--c,var(--foreground-secondary));background:rgba(var(--hl),.08)}
+.mx-sts-g{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.mx-st{display:flex;flex-direction:column;gap:2px;min-width:0;padding:10px;border-radius:12px;background:var(--inset)}
+.mx-stl{font-size:10.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--muted)}
+.mx-stv{display:flex;align-items:baseline;gap:3px;white-space:nowrap;min-width:0;overflow:hidden}
+.mx-stv .ui-num{font-family:var(--f-num);font-size:21px;font-weight:600;color:var(--foreground)}
+.mx-stv .mx-u{font-size:11px}
+.mx-stv.good .ui-num{color:var(--optimal-text,var(--optimal))}
+.mx-stv.bad .ui-num{color:var(--red-text)}
+.mx-sts{font-size:11.5px;color:var(--muted)}
+.mx-trend .mx-ar{margin-top:5px}
+.mx-trend{display:flex;align-items:flex-start;gap:6px;line-height:1.4;font-size:13.5px;font-weight:600;color:var(--foreground-secondary)}
+.mx-trend.good{color:var(--optimal-text,var(--optimal))}
+.mx-trend.bad{color:var(--red-text)}
+.mx-gt{font-size:14px;line-height:1.5;color:var(--foreground-secondary)}
+.mx-gs{font-size:12px;line-height:1.4;color:var(--muted)}
+.mx-guide > * + *,.mx-about > * + *{margin-top:8px}
+/* Home: pinned metrics */
+.mxh{display:block}
+.mxh-card{padding:14px 14px 12px}
+.mxh .ui-card-h{min-height:44px}
+.mxh-card > * + *{margin-top:10px}
+.mxh-g{display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:8px}
+.mxh-t{display:flex;flex-direction:column;gap:3px;min-width:0;min-height:76px;padding:10px;border:0;border-radius:12px;background:var(--inset);text-align:left;font:inherit;color:var(--foreground);cursor:pointer}
+.mxh-t:hover{background:var(--secondary)}
+.mxh-t:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.mxh-t .mx-tl{font-size:10.5px}
+.mxh-t .mx-v{margin-top:2px}
+.mxh-t .mx-v .ui-num{font-size:21px}
+.mxh-t .mx-u{font-size:11px}
+.mxh-t .mx-ch{font-size:11px}
+.mxh-dot{flex:none;width:7px;height:7px;border-radius:50%;background:var(--c)}
+@media (prefers-reduced-motion:reduce){.mx-tile{transition:none}.mx-tile:active{transform:none}}
+`,
+  };
+
+  /* ---------------- Home: pinned metrics ---------------- */
+  App.homeCards.push({
+    key: "metrics-pins",
+    order: 30,
+    render(ctx) {
+      const p = pins();
+      if (!p.length || !ctx || !ctx.days || !ctx.days.length) return "";
+      const end = ctx.i >= 0 ? ctx.i : latestIdx(ctx.days, todayStr());
+      if (end < 0) return "";
+      const model = modelOf(ctx);
+      const today = todayStr();
+      const tiles = p.map((k) => {
+        const m = DEF[k];
+        const t = tile(model, k, end, today);
+        const aria = `${m.label}: ${t.has ? fmtV(m, t.value) + (m.unit ? " " + m.unit : "") : "no recent data"}. Open details`;
+        return `<button type="button" class="mxh-t" data-action="mx-open" data-key="${k}" style="--c:${m.color}" aria-label="${esc(aria)}">
+          <span class="mx-th"><span class="mxh-dot" aria-hidden="true"></span><span class="mx-tl">${esc(m.short || m.label)}</span></span>
+          ${t.has ? valHtml(m, t.value, false, true) : `<span class="mx-v"><span class="ui-num">${DASH}</span></span>`}
+          ${t.has ? changeHtml(m, t, true) : `<span class="mx-ch none">No recent data</span>`}
+        </button>`;
+      });
+      return `<section class="mxh"><div class="ui-card mxh-card"><button type="button" class="ui-card-h link" data-action="core-go" data-view="metrics"><span class="ui-card-t">Key metrics</span><span class="ui-card-m">vs 30-day avg</span>${ic("chevR", 18, 2)}</button><div class="mxh-g">${tiles.join("")}</div></div></section>`;
+    },
+  });
+
+  /* ---------------- handlers ---------------- */
+  App.on("mx-open", (el) => {
+    const k = el && el.dataset.key;
+    if (!DEF[k]) return;
+    if (App.view() !== "metrics") {
+      ST.sel = k;
+      ST.toTop = true;
+      ST.pushed = null;
+      App.go("metrics");
+      setHash(k, false);
+      return;
+    }
+    try { ST.scroll = root.scrollY || 0; } catch (e) { ST.scroll = 0; }
+    ST.sel = k;
+    ST.toTop = true;
+    ST.pushed = setHash(k, true) ? k : null;
+    App.rerender();
+  });
+  App.on("mx-close", () => {
+    const pushed = ST.pushed && ST.pushed === ST.sel && hashKey() === ST.sel;
+    ST.sel = null;
+    ST.pushed = null;
+    ST.restore = ST.scroll || 0;
+    let back = false;
+    if (pushed) try { root.history.back(); back = true; } catch (e) {}
+    if (!back) setHash(null, false);
+    App.rerender();
+  });
+  App.on("mx-range", (el) => {
+    const k = el && el.dataset.k;
+    if (!RANGE[k] || k === ST.range) return;
+    ST.range = k;
+    App.rerender();
+  });
+  App.on("mx-pin", (el) => {
+    const k = el && el.dataset.key;
+    if (!DEF[k]) return;
+    const d = App.docGet(DOC) || {};
+    const p = pins();
+    const on = p.includes(k);
+    d.pins = on ? p.filter((x) => x !== k) : p.concat(k);
+    App.docSet(DOC, d);
+    App.toast(on ? `${DEF[k].short || DEF[k].label} removed from Home.` : `${DEF[k].short || DEF[k].label} pinned to Home.`);
+  });
+  /* browser back / forward between the grid and a detail */
+  root.addEventListener("hashchange", () => {
+    if (App.view() !== "metrics") {
+      const h = hashKey();
+      if (h === undefined) { ST.sel = null; ST.pushed = null; }
+      return;
+    }
+    const h = hashKey();
+    if (h === undefined) return;
+    if (h !== ST.sel) {
+      if (!h) ST.restore = ST.scroll || 0;
+      else ST.toTop = true;
+      ST.sel = h;
+      App.rerender();
+    }
+  });
+})(typeof window !== "undefined" ? window : globalThis);
+</script>
 <script>/* Cadence view: Data (source status, import, phone app, profile, backup). */
 (function () {
   "use strict";
@@ -26238,6 +28104,19 @@ html.aix-lock,html.aix-lock body{overflow:hidden}
  * covers, using one source per day (the one with the most steps) to avoid phone + watch double counts.
  *
  * API reference: https://developers.google.com/health/reference/rest/v4/users.dataTypes.dataPoints
+ *
+ * Paired devices (v8, band battery): GET /v4/users/me/pairedDevices (pageSize ≤ 100, nextPageToken) with the
+ * OPTIONAL scope googlehealth.settings.readonly. It is asked for on interactive sign-ins (connect()) but never
+ * counts as a "missing scope": without it the device fetch is simply skipped. silentRefresh() asks only for the
+ * required scopes (include_granted_scopes brings the optional one along once granted), so a user who never
+ * granted it is not pushed into a consent prompt on every silent refresh. If a sign-in that asked for it comes
+ * back without it, connect() stops asking until connect({ devices: true }) (the "Allow battery access" tap).
+ *   GoogleHealth.fetchDevices()       → {ok:true, devices:[…], fetchedAt} | {ok:false, reason}
+ *   GoogleHealth.refreshDevices(opts) → same; throttled (10 min) and shared by concurrent callers; never rejects.
+ *     Runs by itself after every successful sync(); results go to CadenceDevice.ingest() and onDevices() listeners.
+ *   GoogleHealth.deviceAccess()       → {signedIn, granted:true|false|null, declined, helper}
+ * Device records keep id, type, name (product name), battery level/status, last sync, version and features;
+ * the MAC address is never kept. Nothing about devices or tokens is logged.
  */
 (function (root) {
   "use strict";
@@ -26251,6 +28130,13 @@ html.aix-lock,html.aix-lock body{overflow:hidden}
   ];
   // identity scopes: only used to read the account email for login_hint (silent re-sign-in)
   const ID_SCOPES = ["openid", "email"];
+  // optional scopes: nice to have, never required for sync (v8: paired devices → band battery)
+  const DEVICE_SCOPE = "https://www.googleapis.com/auth/googlehealth.settings.readonly";
+  const OPT_SCOPES = [DEVICE_SCOPE];
+  const OPT_KEY = "cadence.gh.opt"; // {declined:[scope], at}: a sign-in that asked for these came back without them
+  const DEVICES_PATH = "/v4/users/me/pairedDevices";
+  const DEVICE_GAP_MS = 10 * 60 * 1000; // device list at most every 10 min (unless forced)
+  const DEVICE_MAX_PAGES = 10;
   const USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo";
   const TOKEN_KEY = "cadence.gh.token";
   const ACCOUNT_KEY = "cadence.gh.account";
@@ -27047,7 +28933,7 @@ html.aix-lock,html.aix-lock body{overflow:hidden}
   /* ==================================================================
    * Network layer
    * ================================================================== */
-  const state = { clientId: "", proxyUrl: "", helperUrl: "", helperNotice: null, token: null, expiresAt: 0, granted: [], email: "", tokenClient: null, gisPromise: null };
+  const state = { clientId: "", proxyUrl: "", helperUrl: "", helperNotice: null, token: null, expiresAt: 0, granted: [], optGranted: [], email: "", tokenClient: null, gisPromise: null };
 
   /* ---------- token persistence (this browser only) ---------- */
   function ls() {
@@ -27080,7 +28966,7 @@ html.aix-lock,html.aix-lock body{overflow:hidden}
   }
   function saveToken() {
     if (!state.token) return lsDel(TOKEN_KEY);
-    lsSet(TOKEN_KEY, { v: 1, token: state.token, expiresAt: state.expiresAt, scopes: state.granted, email: state.email || "", clientId: state.clientId || "" });
+    lsSet(TOKEN_KEY, { v: 1, token: state.token, expiresAt: state.expiresAt, scopes: state.granted, opt: state.optGranted || [], email: state.email || "", clientId: state.clientId || "" });
     if (state.email) lsSet(ACCOUNT_KEY, { email: state.email, clientId: state.clientId || "" });
   }
   // drop the token (memory + storage). keepAccount=false also forgets the account hint.
@@ -27088,6 +28974,7 @@ html.aix-lock,html.aix-lock body{overflow:hidden}
     state.token = null;
     state.expiresAt = 0;
     state.granted = [];
+    state.optGranted = [];
     lsDel(TOKEN_KEY);
     if (!keepAccount) {
       state.email = "";
@@ -27110,6 +28997,7 @@ html.aix-lock,html.aix-lock body{overflow:hidden}
     state.token = r.token;
     state.expiresAt = r.expiresAt;
     state.granted = Array.isArray(r.scopes) ? r.scopes.filter((s) => typeof s === "string") : [];
+    state.optGranted = Array.isArray(r.opt) ? OPT_SCOPES.filter((s) => r.opt.includes(s)) : [];
     if (typeof r.email === "string" && r.email) state.email = r.email;
     if (r.clientId && !state.clientId) state.restoredClientId = r.clientId;
     return true;
@@ -27227,6 +29115,7 @@ html.aix-lock,html.aix-lock body{overflow:hidden}
     state.expiresAt = Date.now() + (Number(j.expires_in) || 3599) * 1000;
     const granted = String(j.scope || "").split(/\s+/).filter(Boolean);
     state.granted = granted.length ? SCOPES.concat(ID_SCOPES).filter((s) => granted.includes(s)) : SCOPES.slice();
+    state.optGranted = OPT_SCOPES.filter((s) => granted.includes(s)); // unknown (no scope string) → treated as not granted
     if (isNum(j.expires_at)) lsSet(HELPER_KEY, Object.assign({}, rec, { expiresAt: j.expires_at }));
     saveToken();
     if (!state.email && state.granted.includes("email")) fetchEmail();
@@ -27307,8 +29196,21 @@ html.aix-lock,html.aix-lock body{overflow:hidden}
     return state.gisPromise;
   }
 
-  // store a GIS token response; returns the missing Google Health scopes
-  function acceptToken(resp, oauth2) {
+  /* optional scopes the user left unticked on a sign-in that asked for them */
+  const optDeclined = () => {
+    const r = lsGet(OPT_KEY);
+    return r && Array.isArray(r.declined) ? OPT_SCOPES.filter((s) => r.declined.includes(s)) : [];
+  };
+  function noteOpt(asked) {
+    if (!asked || !asked.length) return;
+    const declined = asked.filter((s) => !state.optGranted.includes(s));
+    const keep = optDeclined().filter((s) => !asked.includes(s));
+    const all = keep.concat(declined);
+    if (all.length) lsSet(OPT_KEY, { declined: all, at: Date.now() });
+    else lsDel(OPT_KEY);
+  }
+  // store a GIS token response; returns the missing Google Health scopes (optional scopes never count as missing)
+  function acceptToken(resp, oauth2, askedOpt) {
     state.token = resp.access_token;
     state.expiresAt = Date.now() + (Number(resp.expires_in) || 3599) * 1000;
     const all = SCOPES.concat(ID_SCOPES);
@@ -27319,14 +29221,22 @@ html.aix-lock,html.aix-lock body{overflow:hidden}
         return SCOPES.includes(s);
       }
     });
+    state.optGranted = OPT_SCOPES.filter((s) => {
+      try {
+        return !!oauth2.hasGrantedAllScopes(resp, s);
+      } catch (e) {
+        return String(resp.scope || "").split(/\s+/).includes(s);
+      }
+    });
+    noteOpt(askedOpt);
     saveToken();
     if (!state.email && state.granted.includes("email")) fetchEmail();
     return SCOPES.filter((s) => !state.granted.includes(s));
   }
-  function initClient(oauth2, extra) {
+  function initClient(oauth2, extra, opt) {
     const o = {
       client_id: state.clientId,
-      scope: SCOPES.concat(ID_SCOPES).join(" "),
+      scope: SCOPES.concat(opt || [], ID_SCOPES).join(" "),
       include_granted_scopes: true,
       callback: () => {},
     };
@@ -27338,6 +29248,8 @@ html.aix-lock,html.aix-lock body{overflow:hidden}
    * connect({ prompt }) — interactive sign-in. Call it from a tap/click so the pop-up is allowed.
    * prompt defaults to "" when this browser has signed in before (Google then usually closes the
    * pop-up by itself), else "consent".
+   * The optional scopes (OPT_SCOPES) are asked for too, unless the user left them unticked before;
+   * opts.devices = true always asks for them again (the "Allow battery access" button).
    */
   async function connect(opts) {
     opts = opts || {};
@@ -27352,6 +29264,8 @@ html.aix-lock,html.aix-lock body{overflow:hidden}
     if (!state.clientId) throw GHError("auth", MSG.no_client);
     await loadGis();
     const oauth2 = root.google.accounts.oauth2;
+    const declined = optDeclined();
+    const askOpt = opts.devices ? OPT_SCOPES.slice() : OPT_SCOPES.filter((s) => !declined.includes(s));
     return new Promise((resolve, reject) => {
       const client = initClient(oauth2, {
         callback: (resp) => {
@@ -27359,8 +29273,8 @@ html.aix-lock,html.aix-lock body{overflow:hidden}
             reject(GHError(resp && resp.error === "access_denied" ? "forbidden" : "auth", resp && resp.error === "access_denied" ? MSG.forbidden : MSG.auth, resp && resp.error));
             return;
           }
-          const missing = acceptToken(resp, oauth2);
-          resolve({ ok: true, expiresAt: state.expiresAt, missingScopes: missing });
+          const missing = acceptToken(resp, oauth2, askOpt);
+          resolve({ ok: true, expiresAt: state.expiresAt, missingScopes: missing, devices: state.optGranted.includes(DEVICE_SCOPE) });
         },
         error_callback: (err) => {
           const t = err && err.type;
@@ -27368,7 +29282,7 @@ html.aix-lock,html.aix-lock body{overflow:hidden}
           if (t) e.reason = t;
           reject(e);
         },
-      });
+      }, askOpt);
       state.tokenClient = client;
       client.requestAccessToken({ prompt: opts.prompt !== undefined ? opts.prompt : state.token || hadAccount() ? "" : "consent" });
     });
@@ -27442,6 +29356,9 @@ html.aix-lock,html.aix-lock body{overflow:hidden}
     }
     lsDel(HELPER_KEY);
     lsDel(HELPER_PAIR_KEY);
+    lsDel(OPT_KEY);
+    devState.lastAt = 0;
+    devState.last = null;
     clearToken(false);
     return new Promise((resolve) => {
       try {
@@ -28114,7 +30031,153 @@ html.aix-lock,html.aix-lock body{overflow:hidden}
       fatal.partial = { days: sortDays(emitted.concat(extra)), failedDays: fd, sources, warnings: allWarnings(), coverage };
       throw fatal;
     }
+    // band battery: fire and forget, after the sync is done (never delays or fails it)
+    if (opts.devices !== false) refreshDevices({ force: opts.devices === "force" }).catch(() => {});
     return { days: sortDays(emitted), sources, warnings: allWarnings(), range: { start: wantList[0], end: wantList[wantList.length - 1], tz }, failedDays: fd, coverage };
+  }
+
+  /* ==================================================================
+   * Paired devices (band battery) — optional scope, never part of the main sync's success
+   * ================================================================== */
+  const devState = { lastAt: 0, last: null, inFlight: null, listeners: [] };
+  const DEV_TYPES = { TRACKER: "tracker", SCALE: "scale", WATCH: "watch", SMARTWATCH: "watch" };
+  const BATT_STATUS = { HIGH: "high", MEDIUM: "medium", LOW: "low", EMPTY: "empty", FULL: "high", CRITICAL: "empty" };
+  const cleanStr = (v, max) => (typeof v === "string" && v.trim() ? v.trim().replace(/[\u0000-\u001f]/g, "").slice(0, max || 80) : "");
+  const firstOf = (o, keys) => {
+    for (const k of keys) if (o[k] !== undefined && o[k] !== null && o[k] !== "") return o[k];
+    return undefined;
+  };
+  /** parseDevice(raw, k) → {id, type, name, version, battery, status, lastSync, features} | null. Defensive: the
+   *  field names may vary; values may be strings. The MAC address is deliberately dropped. */
+  function parseDevice(raw, k) {
+    if (!raw || typeof raw !== "object") return null;
+    const resName = cleanStr(firstOf(raw, ["name", "id", "deviceId"]), 200);
+    const id = (resName.split("/").pop() || "").replace(/[^A-Za-z0-9_.:-]/g, "").slice(0, 64) || `device-${k + 1}`;
+    const rawType = cleanStr(String(firstOf(raw, ["deviceType", "type"]) || ""), 40).toUpperCase().replace(/^DEVICE_TYPE_/, "");
+    const type = DEV_TYPES[rawType] || "device";
+    const version = cleanStr(firstOf(raw, ["deviceVersion", "productName", "model"]), 60);
+    const display = cleanStr(firstOf(raw, ["displayName", "deviceName"]), 60);
+    const name = display || version || (type === "scale" ? "Scale" : type === "tracker" ? "Fitbit tracker" : "Device");
+    let lvl = num(firstOf(raw, ["batteryLevel", "batteryPercent", "battery"]));
+    const battery = isNum(lvl) ? Math.max(0, Math.min(100, Math.round(lvl))) : null;
+    const st = cleanStr(String(firstOf(raw, ["batteryStatus", "batteryState"]) || ""), 20).toUpperCase().replace(/^BATTERY_STATUS_/, "");
+    const status = BATT_STATUS[st] || null;
+    const ls = firstOf(raw, ["lastSyncTime", "lastSync", "lastSyncedTime"]);
+    const lsMs = typeof ls === "string" ? tms(ls) : isNum(ls) ? ls : undefined;
+    const lastSync = isNum(lsMs) && lsMs > 946684800000 && lsMs < Date.now() + 864e5 ? new Date(lsMs).toISOString() : null;
+    const features = Array.isArray(raw.features) ? raw.features.filter((f) => typeof f === "string" && /^[A-Z0-9_]{1,40}$/.test(f)).slice(0, 80) : [];
+    return { id, type, name, version: version || null, battery, status, lastSync, features };
+  }
+  function parseDevices(pages) {
+    const out = [];
+    const seen = new Set();
+    for (const j of pages || []) {
+      const list = j && (Array.isArray(j.pairedDevices) ? j.pairedDevices : Array.isArray(j.devices) ? j.devices : []);
+      for (const raw of list || []) {
+        const d = parseDevice(raw, out.length);
+        if (!d) continue;
+        let id = d.id;
+        for (let n = 2; seen.has(id); n++) id = `${d.id}-${n}`;
+        d.id = id;
+        seen.add(id);
+        out.push(d);
+        if (out.length >= 50) return out;
+      }
+    }
+    return out;
+  }
+  const hasDeviceScope = () => state.optGranted.includes(DEVICE_SCOPE);
+  /** deviceAccess() → {signedIn, granted: true|false|null (null = no live token, unknown), declined, helper} */
+  function deviceAccess() {
+    const live = tokenStatus().valid;
+    const helper = helperActive();
+    return { signedIn: live || helper, granted: live ? hasDeviceScope() : null, declined: optDeclined().includes(DEVICE_SCOPE), helper };
+  }
+  /** fetchDevices() → {ok:true, devices, fetchedAt} | {ok:false, reason:"not_connected"|"no_scope"|"forbidden"|"auth"|"network"|"rate_limited"|"error", status?}
+   *  One plain request per page (no retries, no sign-in, never clears the token). Never rejects. */
+  async function fetchDevices() {
+    if (!tokenStatus().valid) return { ok: false, reason: "not_connected" };
+    if (!hasDeviceScope()) return { ok: false, reason: "no_scope" };
+    const f = root.fetch || (typeof fetch !== "undefined" ? fetch : null);
+    if (!f) return { ok: false, reason: "network" };
+    const base = state.proxyUrl || API_HOST;
+    const pages = [];
+    let pageToken = "";
+    for (let p = 0; p < DEVICE_MAX_PAGES; p++) {
+      const qs = "pageSize=100" + (pageToken ? "&pageToken=" + encodeURIComponent(pageToken) : "");
+      let res, j = null;
+      try {
+        await throttle(-1);
+        res = await f(`${base}${DEVICES_PATH}?${qs}`, { method: "GET", headers: { Authorization: `Bearer ${state.token}`, Accept: "application/json" } });
+      } catch (e) {
+        return { ok: false, reason: "network" };
+      }
+      if (!res || !res.ok) {
+        const status = res ? res.status : 0;
+        if (status === 403) {
+          // the optional scope is gone (or never really granted): stop trying until the user allows it again
+          state.optGranted = state.optGranted.filter((s) => s !== DEVICE_SCOPE);
+          saveToken();
+          return { ok: false, reason: "forbidden", status };
+        }
+        return { ok: false, reason: status === 401 ? "auth" : status === 429 ? "rate_limited" : "error", status };
+      }
+      try {
+        j = await res.json();
+      } catch (e) {
+        return { ok: false, reason: "error" };
+      }
+      pages.push(j || {});
+      pageToken = j && typeof j.nextPageToken === "string" ? j.nextPageToken : "";
+      if (!pageToken) break;
+    }
+    return { ok: true, devices: parseDevices(pages), fetchedAt: new Date().toISOString() };
+  }
+  function emitDevices(r) {
+    const sinks = devState.listeners.slice();
+    const dev = root.CadenceDevice;
+    if (dev && typeof dev.ingest === "function") sinks.push((x) => dev.ingest(x));
+    for (const fn of sinks) {
+      try {
+        const p = fn(r);
+        if (p && typeof p.catch === "function") p.catch(() => {});
+      } catch (e) {}
+    }
+  }
+  /** refreshDevices({force}) — fetch the device list at most every 10 min (a failed or forced call is not throttled),
+   *  share one in-flight request, hand the result to CadenceDevice.ingest() + onDevices() listeners. Never rejects.
+   *  → result of fetchDevices(), or {ok:false, reason:"throttled", last} */
+  async function refreshDevices(opts) {
+    opts = opts || {};
+    if (devState.inFlight) return devState.inFlight;
+    if (!opts.force && devState.last && devState.last.ok && Date.now() - devState.lastAt < DEVICE_GAP_MS) return { ok: false, reason: "throttled", last: devState.last };
+    devState.inFlight = (async () => {
+      let r;
+      try {
+        r = await fetchDevices();
+      } catch (e) {
+        r = { ok: false, reason: "error" };
+      }
+      if (r.reason !== "not_connected") {
+        devState.lastAt = Date.now();
+        devState.last = r;
+      }
+      emitDevices(r);
+      return r;
+    })();
+    try {
+      return await devState.inFlight;
+    } finally {
+      devState.inFlight = null;
+    }
+  }
+  function onDevices(fn) {
+    if (typeof fn !== "function") return () => {};
+    devState.listeners.push(fn);
+    return () => {
+      const k = devState.listeners.indexOf(fn);
+      if (k >= 0) devState.listeners.splice(k, 1);
+    };
   }
 
   const LABELS = {
@@ -28133,8 +30196,9 @@ html.aix-lock,html.aix-lock body{overflow:hidden}
   const api = {
     configure, connect, isConnected, disconnect, sync, mapResponses, toImport,
     silentRefresh, tokenStatus, helperStatus, helperToken, consumeHelperRedirect, helperClaimPair,
-    scopes: SCOPES.slice(), identityScopes: ID_SCOPES.slice(), LIST_TYPES, ROLLUP_TYPES,
-    _internal: { filterFor, midnightMs, localInfo, localIso, chunks, request, state, bucket, getHrMode: () => hrMode, setHrMode: (m) => (hrMode = m === "list" ? "list" : "rollup"), restoreToken, clearToken, TOKEN_KEY, ACCOUNT_KEY, HELPER_KEY, HELPER_PAIR_KEY },
+    fetchDevices, refreshDevices, onDevices, deviceAccess, parseDevices,
+    scopes: SCOPES.slice(), identityScopes: ID_SCOPES.slice(), optionalScopes: OPT_SCOPES.slice(), LIST_TYPES, ROLLUP_TYPES,
+    _internal: { filterFor, midnightMs, localInfo, localIso, chunks, request, state, bucket, getHrMode: () => hrMode, setHrMode: (m) => (hrMode = m === "list" ? "list" : "rollup"), restoreToken, clearToken, TOKEN_KEY, ACCOUNT_KEY, HELPER_KEY, HELPER_PAIR_KEY, OPT_KEY, devState, DEVICE_SCOPE },
   };
   restoreToken(); // a refresh within the token's lifetime needs no sign-in
   consumeHelperRedirect(); // back from the helper's Google sign-in: keep the device id, clean the URL
