@@ -22361,6 +22361,471 @@ button.glh-card:focus-visible{outline:2px solid var(--accent);outline-offset:2px
   App.on("gl-ai", () => { runAi(); });
 })(typeof window !== "undefined" ? window : globalThis);
 </script>
+<script>/*
+ * Cadence — monthly report as a real PDF file, built in the browser (no print dialog, no libraries).
+ * window.CadenceReportPdf = { build(model) → Uint8Array, deliver(bytes, fileName) → Promise<"shared"|"downloaded"|"opened"|"failed"> }
+ *
+ * Why: iPhone Home Screen web apps (and some embedded browsers) ignore window.print(), so "Save as PDF" did nothing.
+ * The report model comes from CadenceShare.monthModel(key). Everything is drawn as vector PDF: Helvetica text (WinAnsi),
+ * filled/stroked paths for charts — small files, crisp at any zoom, selectable text. A4 portrait, white paper.
+ */
+(function (root) {
+  "use strict";
+  const isNum = (v) => typeof v === "number" && isFinite(v);
+  const PW = 595.28, PH = 841.89, M = 40, CW = PW - 2 * M;
+
+  /* paper palette (same as the print stylesheet) */
+  const P = {
+    ink: "#15181c", ink2: "#3f4650", muted: "#68707b", line: "#e2e5e9", grid: "#eceef1", panel: "#f5f6f8", track: "#e6e8eb",
+    green: "#14a44d", yellow: "#d9a300", red: "#dc2f45", sleep: "#5b87ad", strain: "#0a7fd0", hrv: "#3a7fc2", rhr: "#cf3a55",
+    accent: "#0a9a6c", weight: "#7a5bd0", good: "#0a8a5f", bad: "#c62a43",
+  };
+
+  /* ---------------- text: WinAnsi encoding + Helvetica metrics via canvas (Arial/Helvetica share widths) ---------------- */
+  const WIN = { 0x20ac: 0x80, 0x201a: 0x82, 0x192: 0x83, 0x201e: 0x84, 0x2026: 0x85, 0x2020: 0x86, 0x2021: 0x87, 0x2c6: 0x88, 0x2030: 0x89, 0x160: 0x8a, 0x2039: 0x8b, 0x152: 0x8c, 0x17d: 0x8e, 0x2018: 0x91, 0x2019: 0x92, 0x201c: 0x93, 0x201d: 0x94, 0x2022: 0x95, 0x2013: 0x96, 0x2014: 0x97, 0x2dc: 0x98, 0x2122: 0x99, 0x161: 0x9a, 0x203a: 0x9b, 0x153: 0x9c, 0x17e: 0x9e, 0x178: 0x9f };
+  const SUBS = { "₂": "2", "≥": ">=", "≤": "<=", "−": "-", "→": "->", "✓": "", " ": " ", " ": " ", " ": " " };
+  function clean(s) {
+    s = String(s == null ? "" : s);
+    let out = "";
+    for (const ch of s) out += SUBS[ch] != null ? SUBS[ch] : ch;
+    return out;
+  }
+  function encode(s) {
+    // → PDF string literal bytes (WinAnsi), escaped
+    let out = "";
+    for (const ch of clean(s)) {
+      const c = ch.codePointAt(0);
+      let b = c < 128 || (c >= 0xa0 && c <= 0xff) ? c : WIN[c];
+      if (b == null) b = 0x3f; // "?"
+      const chr = String.fromCharCode(b);
+      out += chr === "(" || chr === ")" || chr === "\\" ? "\\" + chr : chr;
+    }
+    return out;
+  }
+  let mctx = null;
+  function width(s, size, bold) {
+    if (!mctx) {
+      try { mctx = document.createElement("canvas").getContext("2d"); } catch (e) { mctx = null; }
+    }
+    const t = clean(s);
+    if (mctx) {
+      mctx.font = `${bold ? "bold " : ""}100px Helvetica, Arial, "Liberation Sans", sans-serif`;
+      return (mctx.measureText(t).width / 100) * size;
+    }
+    return t.length * size * (bold ? 0.58 : 0.52);
+  }
+  function wrapText(s, size, bold, maxW) {
+    const words = clean(s).split(/\s+/).filter(Boolean);
+    const lines = [];
+    let cur = "";
+    for (const w of words) {
+      const t = cur ? cur + " " + w : w;
+      if (width(t, size, bold) <= maxW || !cur) cur = t;
+      else { lines.push(cur); cur = w; }
+    }
+    if (cur) lines.push(cur);
+    return lines;
+  }
+  const rgb = (hex) => {
+    const h = hex.replace("#", "");
+    const n = parseInt(h.length === 3 ? h.split("").map((c) => c + c).join("") : h, 16);
+    return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255].map((x) => x.toFixed(3)).join(" ");
+  };
+  const f = (n) => (Math.round(n * 100) / 100).toString();
+
+  /* ---------------- a tiny PDF writer: pages of content streams, Helvetica + Helvetica-Bold ---------------- */
+  function Doc(title) {
+    const pages = [];
+    let ops = null;
+    const Y = (y) => PH - y; // top-left coordinates in, PDF bottom-left out
+    const d = {
+      page() { ops = []; pages.push(ops); },
+      text(s, x, y, size, o) {
+        o = o || {};
+        const t = clean(s);
+        if (!t) return 0;
+        const w = width(t, size, o.bold);
+        const xx = o.align === "right" ? x - w : o.align === "center" ? x - w / 2 : x;
+        ops.push(`BT /${o.bold ? "F2" : "F1"} ${f(size)} Tf ${rgb(o.color || P.ink)} rg ${f(xx)} ${f(Y(y))} Td (${encode(t)}) Tj ET`);
+        return w;
+      },
+      rect(x, y, w, h, color, r) {
+        if (w <= 0 || h <= 0) return;
+        ops.push(`${rgb(color)} rg`);
+        r = Math.min(r || 0, w / 2, h / 2);
+        if (!r) { ops.push(`${f(x)} ${f(Y(y + h))} ${f(w)} ${f(h)} re f`); return; }
+        const k = 0.5523 * r, x2 = x + w, y2 = y + h;
+        ops.push(`${f(x + r)} ${f(Y(y))} m ${f(x2 - r)} ${f(Y(y))} l ${f(x2 - r + k)} ${f(Y(y))} ${f(x2)} ${f(Y(y + r - k))} ${f(x2)} ${f(Y(y + r))} c ` +
+          `${f(x2)} ${f(Y(y2 - r))} l ${f(x2)} ${f(Y(y2 - r + k))} ${f(x2 - r + k)} ${f(Y(y2))} ${f(x2 - r)} ${f(Y(y2))} c ` +
+          `${f(x + r)} ${f(Y(y2))} l ${f(x + r - k)} ${f(Y(y2))} ${f(x)} ${f(Y(y2 - r + k))} ${f(x)} ${f(Y(y2 - r))} c ` +
+          `${f(x)} ${f(Y(y + r))} l ${f(x)} ${f(Y(y + r - k))} ${f(x + r - k)} ${f(Y(y))} ${f(x + r)} ${f(Y(y))} c f`);
+      },
+      line(x1, y1, x2, y2, color, lw, dash) {
+        ops.push(`${rgb(color)} RG ${f(lw || 0.6)} w ${dash ? `[${dash.join(" ")}] 0 d` : "[] 0 d"} 1 J ${f(x1)} ${f(Y(y1))} m ${f(x2)} ${f(Y(y2))} l S`);
+      },
+      poly(pts, color, lw, dash) {
+        if (pts.length < 2) return;
+        ops.push(`${rgb(color)} RG ${f(lw || 1.4)} w ${dash ? `[${dash.join(" ")}] 0 d` : "[] 0 d"} 1 J 1 j ${pts.map((p, i) => `${f(p[0])} ${f(Y(p[1]))} ${i ? "l" : "m"}`).join(" ")} S`);
+      },
+      dot(x, y, r, color) {
+        const k = 0.5523 * r;
+        ops.push(`${rgb(color)} rg ${f(x + r)} ${f(Y(y))} m ${f(x + r)} ${f(Y(y - k))} ${f(x + k)} ${f(Y(y - r))} ${f(x)} ${f(Y(y - r))} c ${f(x - k)} ${f(Y(y - r))} ${f(x - r)} ${f(Y(y - k))} ${f(x - r)} ${f(Y(y))} c ${f(x - r)} ${f(Y(y + k))} ${f(x - k)} ${f(Y(y + r))} ${f(x)} ${f(Y(y + r))} c ${f(x + k)} ${f(Y(y + r))} ${f(x + r)} ${f(Y(y + k))} ${f(x + r)} ${f(Y(y))} c f`);
+      },
+      count: () => pages.length,
+      bytes() {
+        // objects: 1 catalog, 2 pages, 3 F1, 4 F2, 5 info, then per page: page obj + content obj
+        const objs = [];
+        const kids = pages.map((_, i) => `${6 + i * 2} 0 R`).join(" ");
+        objs[1] = "<< /Type /Catalog /Pages 2 0 R >>";
+        objs[2] = `<< /Type /Pages /Kids [${kids}] /Count ${pages.length} >>`;
+        objs[3] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>";
+        objs[4] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>";
+        const now = new Date();
+        const p2 = (n) => String(n).padStart(2, "0");
+        const pdfDate = `D:${now.getFullYear()}${p2(now.getMonth() + 1)}${p2(now.getDate())}${p2(now.getHours())}${p2(now.getMinutes())}${p2(now.getSeconds())}`;
+        objs[5] = `<< /Title (${encode(title)}) /Creator (Cadence) /Producer (Cadence) /CreationDate (${pdfDate}) >>`;
+        pages.forEach((o, i) => {
+          const stream = o.join("\n");
+          objs[6 + i * 2] = `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${f(PW)} ${f(PH)}] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents ${7 + i * 2} 0 R >>`;
+          objs[7 + i * 2] = `<< /Length ${latin1Len(stream)} >>\nstream\n${stream}\nendstream`;
+        });
+        let out = "%PDF-1.4\n%âãÏÓ\n";
+        const offs = [];
+        for (let i = 1; i < objs.length; i++) {
+          offs[i] = latin1Len(out);
+          out += `${i} 0 obj\n${objs[i]}\nendobj\n`;
+        }
+        const xref = latin1Len(out);
+        out += `xref\n0 ${objs.length}\n0000000000 65535 f \n`;
+        for (let i = 1; i < objs.length; i++) out += `${String(offs[i]).padStart(10, "0")} 00000 n \n`;
+        out += `trailer\n<< /Size ${objs.length} /Root 1 0 R /Info 5 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+        const bytes = new Uint8Array(out.length);
+        for (let i = 0; i < out.length; i++) bytes[i] = out.charCodeAt(i) & 255;
+        return bytes;
+      },
+    };
+    return d;
+  }
+  const latin1Len = (s) => s.length; // every char we emit is a single byte (WinAnsi / ASCII)
+
+  /* ---------------- charts (port of the report's SVG chart) ---------------- */
+  function niceStep(span, n) {
+    const raw = span / Math.max(1, n);
+    const p = Math.pow(10, Math.floor(Math.log10(raw)));
+    const q = raw / p;
+    return (q < 1.5 ? 1 : q < 3 ? 2 : q < 7 ? 5 : 10) * p;
+  }
+  const n0 = (v) => (isNum(v) ? Math.round(v).toLocaleString("en-US") : "–");
+  const n1 = (v) => (isNum(v) ? (Math.round(v * 10) / 10).toFixed(1) : "–");
+  function chart(doc, spec, x, y, W, H) {
+    const L = 30, R = 6, T = 6, B = 16;
+    const pw = W - L - R, ph = H - T - B;
+    const vals = spec.vals || [];
+    const n = vals.length || 1;
+    const all = vals.concat(spec.line2 ? spec.line2.vals : []).concat(spec.ref && isNum(spec.ref.v) ? [spec.ref.v] : []).filter(isNum);
+    if (!all.length) {
+      doc.text("No data this month", x + W / 2, y + H / 2, 8, { color: P.muted, align: "center" });
+      return;
+    }
+    let lo, hi, ticks;
+    if (spec.ticks) { ticks = spec.ticks.slice(); lo = ticks[0]; hi = ticks[ticks.length - 1]; }
+    else {
+      lo = spec.zero ? 0 : Math.min(...all);
+      hi = Math.max(...all);
+      if (hi === lo) { hi += 1; lo = spec.zero ? 0 : lo - 1; }
+      const st = niceStep(hi - lo, 3);
+      lo = spec.zero ? 0 : Math.floor((lo - st * 0.25) / st) * st;
+      hi = Math.ceil((hi + st * 0.15) / st) * st;
+      ticks = [];
+      for (let t = lo; t <= hi + st * 0.001; t += st) ticks.push(Math.round(t * 1000) / 1000);
+    }
+    const yy = (v) => y + T + ph - ((v - lo) / (hi - lo)) * ph;
+    const slot = pw / n;
+    const xc = (i) => x + L + slot * (i + 0.5);
+    const fy = spec.fmtY || ((v) => (Math.abs(v) < 10 && v % 1 ? n1(v) : n0(v)));
+    ticks.forEach((t) => {
+      doc.line(x + L, yy(t), x + W - R, yy(t), P.grid, 0.5);
+      doc.text(fy(t), x + L - 4, yy(t) + 2.5, 6.5, { color: P.muted, align: "right" });
+    });
+    for (let i = 0; i < n; i++) {
+      const lab = spec.labels ? spec.labels[i] : i % 7 === 0 ? String(i + 1) : "";
+      if (lab) doc.text(lab, xc(i), y + H - 3, 6.5, { color: P.muted, align: "center" });
+    }
+    if (spec.kind === "bar") {
+      const bw = Math.max(1.5, Math.min(12, slot * 0.64));
+      const base = yy(Math.max(lo, 0));
+      vals.forEach((v, i) => {
+        if (!isNum(v)) return;
+        const top = yy(Math.min(hi, Math.max(lo, v)));
+        const h = Math.max(1, base - top);
+        doc.rect(xc(i) - bw / 2, base - h, bw, h, spec.colorAt ? spec.colorAt(i, v) : spec.color, Math.min(1.6, bw / 2));
+      });
+    }
+    const line = (vs, color, dash, dots) => {
+      let run = [];
+      const flush = () => { if (run.length > 1) doc.poly(run, color, dash ? 1 : 1.5, dash ? [3, 3] : null); run = []; };
+      vs.forEach((v, i) => {
+        if (!isNum(v)) return flush();
+        run.push([xc(i), yy(v)]);
+        const iso = !isNum(vs[i - 1]) && !isNum(vs[i + 1]);
+        if (dots || iso) doc.dot(xc(i), yy(v), iso ? 1.8 : 1.4, color);
+      });
+      flush();
+    };
+    if (spec.kind === "line") line(vals, spec.color, false, n <= 31 && vals.filter(isNum).length <= 12);
+    if (spec.line2) line(spec.line2.vals, spec.line2.color, !!spec.line2.dash, false);
+    if (spec.ref && isNum(spec.ref.v) && spec.ref.v >= lo && spec.ref.v <= hi) {
+      doc.line(x + L, yy(spec.ref.v), x + W - R, yy(spec.ref.v), P.ink2, 0.7, [2, 2]);
+      if (spec.ref.label) doc.text(spec.ref.label, x + W - R, yy(spec.ref.v) - 2.5, 6.5, { color: P.ink2, align: "right" });
+    }
+  }
+
+  /* ---------------- the report layout ---------------- */
+  function build(m, opts) {
+    opts = opts || {};
+    const CS = root.CadenceShare || {};
+    const doc = Doc(`Cadence report ${m.title || m.key}`);
+    const pal = { green: P.green, yellow: P.yellow, red: P.red };
+    const monthTitle = opts.monthName || m.key;
+    let y = 0, pageNo = 0;
+    const footer = () => {
+      doc.line(M, PH - 30, PW - M, PH - 30, P.line, 0.5);
+      doc.text(`Cadence · ${monthTitle}`, M, PH - 18, 7, { color: P.muted });
+      doc.text("Estimates from wearable data. Not medical advice.", PW / 2, PH - 18, 7, { color: P.muted, align: "center" });
+      doc.text(`Page ${pageNo}`, PW - M, PH - 18, 7, { color: P.muted, align: "right" });
+    };
+    const newPage = () => {
+      if (pageNo) footer();
+      doc.page();
+      pageNo++;
+      y = M;
+    };
+    const need = (h) => { if (y + h > PH - 44) newPage(); };
+    // a heading always moves to the next page together with the first part of its content
+    const secHead = (title, meta, body) => {
+      need(30 + (body == null ? 60 : body));
+      y += 6;
+      doc.text(title.toUpperCase(), M, y + 9, 8.5, { bold: true, color: P.ink });
+      if (meta) doc.text(meta, PW - M, y + 9, 7.5, { color: P.muted, align: "right" });
+      doc.line(M, y + 15, PW - M, y + 15, P.line, 0.6);
+      y += 24;
+    };
+    const legend = (items) => {
+      let x = M;
+      items.forEach(([c, t, dash]) => {
+        if (dash) doc.line(x, y + 3.5, x + 10, y + 3.5, c, 1, [2, 2]);
+        else doc.rect(x, y, 8, 7, c, 1.5);
+        x += 13 + doc.text(t, x + 13, y + 6.5, 7, { color: P.ink2 }) + 12;
+      });
+      y += 14;
+    };
+    const minis = (items, cols) => {
+      const gap = 8, w = (CW - gap * (cols - 1)) / cols;
+      need(40);
+      items.forEach(([l, v], i) => {
+        const x = M + i * (w + gap);
+        doc.rect(x, y, w, 34, P.panel, 5);
+        doc.text(String(l).toUpperCase(), x + 8, y + 12, 6.2, { bold: true, color: P.muted });
+        doc.text(v, x + 8, y + 27, 11, { bold: true });
+      });
+      y += 42;
+    };
+    const para = (s, size, color, maxW, x0) => {
+      const lines = wrapText(s, size, false, maxW || CW);
+      lines.forEach((ln) => { need(size + 4); doc.text(ln, x0 || M, y + size, size, { color: color || P.ink2 }); y += size * 1.45; });
+    };
+
+    newPage();
+    /* header */
+    doc.dot(M + 9, y + 9, 9, P.track);
+    doc.dot(M + 9, y + 9, 5.5, "#ffffff");
+    doc.dot(M + 9, y + 9, 2.6, P.accent);
+    doc.text("CADENCE", M + 24, y + 12.5, 10, { bold: true, color: P.ink });
+    doc.text("MONTHLY REPORT", PW - M, y + 6, 7.5, { bold: true, color: P.accent, align: "right" });
+    doc.text(monthTitle, PW - M, y + 30, 22, { bold: true, align: "right" });
+    const period = opts.period || "";
+    doc.text(period, PW - M, y + 44, 7.5, { color: P.muted, align: "right" });
+    y += 58;
+
+    /* summary */
+    secHead("Summary");
+    para((m.summary || []).join(" "), 9, P.ink2);
+    y += 6;
+    const tiles = opts.tiles || [];
+    const tw = (CW - 3 * 8) / 4;
+    for (let r = 0; r < Math.ceil(tiles.length / 4); r++) {
+      need(52);
+      tiles.slice(r * 4, r * 4 + 4).forEach((t, i) => {
+        const x = M + i * (tw + 8);
+        doc.rect(x, y, tw, 46, P.panel, 6);
+        doc.text(t.label.toUpperCase(), x + 8, y + 12, 6.2, { bold: true, color: P.muted });
+        const vw = doc.text(t.value, x + 8, y + 29, 15, { bold: true });
+        if (t.unit) doc.text(t.unit, x + 10 + vw, y + 29, 7, { color: P.muted });
+        if (t.sub) doc.text(t.sub, x + 8, y + 40, 6.5, { color: t.tone === "up" ? P.good : t.tone === "down" ? P.bad : P.muted });
+      });
+      y += 54;
+    }
+
+    const S = opts.specs || {};
+    const hm = opts.hm || ((v) => (isNum(v) ? `${Math.floor(v / 60)}h ${String(Math.round(v % 60)).padStart(2, "0")}m` : "–"));
+    const dShort = opts.dShort || ((d) => d);
+    const a = m.avg || {};
+
+    /* sleep */
+    secHead("Sleep", m.sleep && m.sleep.best ? `Longest: ${hm(m.sleep.best.sleepMin)} on ${dShort(m.sleep.best.date)}` : "", 150);
+    if (S.sleep) { chart(doc, S.sleep, M, y, CW, 120); y += 124; legend([[P.sleep, "Asleep"], [P.ink2, "Sleep need", true]]); }
+    minis([["Average", hm(a.sleepMin)], ["Nights 85%+ of need", m.sleep && m.sleep.withNeed ? `${m.sleep.met}/${m.sleep.withNeed}` : "–"],
+      ["Performance", isNum(a.sleepPerf) ? `${n0(a.sleepPerf)}%` : "–"], ["Consistency", isNum(a.consistency) ? `${n0(a.consistency)}%` : "–"]], 4);
+
+    /* recovery */
+    secHead("Recovery", isNum(a.recovery) ? `Average ${n0(a.recovery)}%` : "", 150);
+    if (S.recovery) { chart(doc, S.recovery, M, y, CW, 120); y += 126; }
+    if (m.recDays) {
+      let x = M;
+      const tot = m.recDays;
+      ["green", "yellow", "red"].forEach((b) => { const w = (m.bands[b] / tot) * CW; doc.rect(x, y, w, 6, pal[b]); x += w; });
+      y += 12;
+      legend(["green", "yellow", "red"].map((b) => [pal[b], `${m.bands[b]} ${b}  ${Math.round((m.bands[b] / tot) * 100)}%`]));
+    }
+
+    /* heart */
+    secHead("Heart", "", 140);
+    const half = (CW - 16) / 2;
+    doc.text("Resting heart rate", M, y + 8, 8.5, { bold: true });
+    doc.text(isNum(a.rhr) ? `avg ${n0(a.rhr)} bpm${m.rhrLow ? ` · low ${n0(m.rhrLow.rhr)} on ${dShort(m.rhrLow.date)}` : ""}` : "–", M, y + 19, 7, { color: P.muted });
+    doc.text("HRV", M + half + 16, y + 8, 8.5, { bold: true });
+    doc.text(isNum(a.hrv) ? `avg ${n0(a.hrv)} ms${m.hrvHigh ? ` · high ${n0(m.hrvHigh.hrv)} on ${dShort(m.hrvHigh.date)}` : ""}` : "–", M + half + 16, y + 19, 7, { color: P.muted });
+    y += 24;
+    if (S.rhr) chart(doc, S.rhr, M, y, half, 100);
+    if (S.hrv) chart(doc, S.hrv, M + half + 16, y, half, 100);
+    y += 108;
+
+    /* fitness + biological age */
+    secHead("Fitness and biological age", "", 112);
+    const boxH = 104, top = y;
+    doc.rect(M, top, half, boxH, P.panel, 7);
+    doc.rect(M + half + 16, top, half, boxH, P.panel, 7);
+    doc.text("VO2max", M + 10, top + 16, 8.5, { bold: true });
+    doc.text("estimate", M + half - 10, top + 16, 7, { color: P.muted, align: "right" });
+    y = top + 22;
+    if (m.vo2 && isNum(m.vo2.value)) {
+      const w = doc.text(n1(m.vo2.value), M + 10, top + 46, 22, { bold: true });
+      doc.text("ml/kg/min", M + 14 + w, top + 46, 7.5, { color: P.muted });
+      const nm = m.vo2.norm;
+      y = top + 56;
+      para(`${nm && nm.text ? nm.text.charAt(0).toUpperCase() + nm.text.slice(1) + " for your age and sex." : ""}${isNum(m.vo2.change) && Math.abs(m.vo2.change) >= 0.1 ? ` ${m.vo2.change > 0 ? "+" : ""}${n1(m.vo2.change)} over the month.` : ""}${isNum(m.vo2.hrr) ? ` Heart-rate drop after exercise: ${n0(m.vo2.hrr)} bpm in 60 s.` : ""}`, 7.5, P.ink2, half - 20, M + 10);
+    } else {
+      y = top + 30;
+      para((m.vo2 && m.vo2.message) || "Not enough data for an estimate yet.", 7.5, P.muted, half - 20, M + 10);
+    }
+    const bx = M + half + 26;
+    doc.text("Biological age", bx, top + 16, 8.5, { bold: true });
+    if (m.lastDate) doc.text(`as of ${dShort(m.lastDate)}`, M + CW - 10, top + 16, 7, { color: P.muted, align: "right" });
+    if (m.bio) {
+      const b = m.bio;
+      const w = doc.text(n1(b.age), bx, top + 46, 22, { bold: true });
+      doc.text("years", bx + 4 + w, top + 46, 7.5, { color: P.muted });
+      doc.text(`${isNum(b.chron) ? `Calendar age ${n1(b.chron)}` : ""}${isNum(b.delta) ? ` · ${b.delta > 0 ? "+" : ""}${n1(b.delta)} years` : ""}`, bx, top + 60, 7.5, { color: P.ink2 });
+      (b.parts || []).slice(0, 3).forEach((p, i) => {
+        doc.text(p.key, bx, top + 74 + i * 10, 7, { color: P.ink2 });
+        doc.text(`${p.years > 0 ? "+" : ""}${n1(p.years)} y`, M + CW - 10, top + 74 + i * 10, 7, { bold: true, color: p.years < 0 ? P.good : p.years > 0 ? P.bad : P.ink2, align: "right" });
+      });
+    } else doc.text("Needs a few weeks of data.", bx, top + 34, 7.5, { color: P.muted });
+    y = top + boxH + 8;
+
+    /* training */
+    secHead("Training load", isNum(a.strainPct) ? `Average strain ${n0(a.strainPct)}% of target` : "", 150);
+    if (S.strain) { chart(doc, S.strain, M, y, CW, 110); y += 114; legend([[P.strain, "Daily strain, % of target"]]); }
+    const W = m.workouts || { n: 0, min: 0, kcal: 0, types: [] };
+    minis([["Workouts", n0(W.n)], ["Time", hm(W.min)], ["Calories", W.kcal ? n0(W.kcal) : "–"]], 3);
+    if (W.types && W.types.length) {
+      need(14 * W.types.length + 6);
+      W.types.forEach((t) => {
+        doc.text(t.type, M, y + 9, 8, { color: P.ink2 });
+        doc.text(`${t.n}×`, M + 200, y + 9, 8, { bold: true, align: "right" });
+        doc.text(hm(t.min), M + 260, y + 9, 8, { color: P.muted, align: "right" });
+        y += 13;
+      });
+      y += 4;
+    }
+    if (m.load && m.load.status) para(`Training load ended the month ${/^(in|at|on|building)/i.test(m.load.status) ? "" : "in the "}${m.load.status}${isNum(m.load.acwr) ? ` (acute:chronic ratio ${n1(m.load.acwr)})` : ""}.`, 8, P.ink2);
+    if (S.load) {
+      need(110);
+      chart(doc, S.load, M, y + 4, CW, 90);
+      y += 98;
+      legend([[P.accent, "Fitness (42-day)"], [P.strain, "Fatigue (7-day)"]]);
+    }
+
+    /* records of the month */
+    const recs = (m.records && m.records.month) || [];
+    if (recs.length) {
+      secHead("Records of the month", "", Math.min(recs.length, 5) * 16);
+      recs.forEach((r) => {
+        need(16);
+        doc.text(r.label, M, y + 9, 8.5, { color: P.ink2 });
+        const vw = doc.text(`${r.valueText}${r.unit ? " " + r.unit : ""}`, PW - M - 70, y + 9, 8.5, { bold: true, align: "right" });
+        doc.text(dShort(r.date), PW - M, y + 9, 7.5, { color: P.muted, align: "right" });
+        doc.line(M, y + 14, PW - M, y + 14, P.grid, 0.5);
+        y += 16;
+        return vw;
+      });
+      const at = (m.records && m.records.allTime) || [];
+      if (at.length) { y += 4; para(`All-time bests set this month: ${at.map((r) => `${r.label}${r.valueText ? ` (${r.valueText}${r.unit ? " " + r.unit : ""})` : ""}`).join(" · ")}`, 7.5, P.ink2); }
+    }
+
+    /* weight */
+    if (m.weight) {
+      secHead("Weight", `${m.weight.n} day${m.weight.n === 1 ? "" : "s"} logged`);
+      if (m.weight.n >= 2 && S.weight) { need(100); chart(doc, S.weight, M, y, CW, 90); y += 96; }
+      minis([["Start", `${n1(m.weight.first.weight)} kg`], ["End", `${n1(m.weight.last.weight)} kg`], ["Change", m.weight.n >= 2 ? `${m.weight.change > 0 ? "+" : ""}${n1(m.weight.change)} kg` : "–"]], 3);
+    }
+    footer();
+    return doc.bytes();
+  }
+
+  /* ---------------- delivery: share sheet → download → open in a new tab ---------------- */
+  async function deliver(bytes, name) {
+    const blob = new Blob([bytes], { type: "application/pdf" });
+    let file = null;
+    try { file = new File([blob], name, { type: "application/pdf" }); } catch (e) {}
+    const nav = root.navigator || {};
+    if (file && nav.canShare && nav.share) {
+      let ok = false;
+      try { ok = nav.canShare({ files: [file] }); } catch (e) {}
+      if (ok) {
+        try {
+          await nav.share({ files: [file], title: name.replace(/\.pdf$/, "") });
+          return "shared";
+        } catch (e) {
+          if (e && e.name === "AbortError") return "cancelled";
+        }
+      }
+    }
+    const url = URL.createObjectURL(blob);
+    try {
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = name;
+      a.rel = "noopener";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      return "downloaded";
+    } catch (e) {
+      try {
+        const w = root.open(url, "_blank");
+        if (w) return "opened";
+      } catch (e2) {}
+    }
+    return "failed";
+  }
+
+  const api = { build, deliver, _chart: chart, _encode: encode };
+  if (typeof module !== "undefined" && module.exports) module.exports = api;
+  root.CadenceReportPdf = api;
+})(typeof window !== "undefined" ? window : globalThis);
+</script>
 <script>/* Cadence — Report & share. Views.share
  *
  * (a) Monthly report: pick a month → a print-optimised A4 report (summary, sleep, recovery, resting HR, HRV,
@@ -22798,20 +23263,21 @@ button.glh-card:focus-visible{outline:2px solid var(--accent);outline-offset:2px
   const C = { green: "var(--rp-green)", yellow: "var(--rp-yellow)", red: "var(--rp-red)", sleep: "var(--rp-sleep)", strain: "var(--rp-strain)", hrv: "var(--rp-hrv)", rhr: "var(--rp-rhr)", ink2: "var(--rp-ink2)", accent: "var(--rp-accent)", weight: "var(--rp-weight)" };
   const MARK_SVG = `<svg class="shr-mark" viewBox="0 0 28 28" aria-hidden="true"><circle cx="14" cy="14" r="10.5" fill="none" stroke-width="2.6" style="stroke:var(--rp-track)"/><path d="M14 3.5A10.5 10.5 0 0 1 24.5 14" fill="none" stroke-width="3" stroke-linecap="round" style="stroke:var(--rp-accent)"/><path d="M7.5 14.6h3.2l1.8-3.6 2.9 6.5 1.8-3h5" fill="none" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="stroke:var(--rp-ink)"/></svg>`;
 
-  function chartSpecs(m) {
+  function chartSpecs(m, Cx) {
+    Cx = Cx || C;
     const R = m.rows;
     const h = (r) => (isNum(r.sleepMin) ? r.sleepMin / 60 : null);
     const S = {
-      sleep: { kind: "bar", vals: R.map(h), color: C.sleep, zero: true, line2: { vals: R.map((r) => (isNum(r.needMin) ? r.needMin / 60 : null)), color: C.ink2, dash: true }, fmtY: (v) => `${v}h`, aria: "Hours asleep each night, with sleep need" },
-      recovery: { kind: "bar", vals: R.map((r) => r.recovery), colorAt: (i) => C[R[i].band || bandOf(R[i].recovery)] || C.ink2, ticks: [0, 33, 67, 100], fmtY: (v) => `${v}%`, aria: "Daily recovery" },
-      rhr: { kind: "line", vals: R.map((r) => r.rhr), color: C.rhr, ref: { v: m.avg.rhr, label: isNum(m.avg.rhr) ? `avg ${n0(m.avg.rhr)}` : "" }, aria: "Resting heart rate" },
-      hrv: { kind: "line", vals: R.map((r) => r.hrv), color: C.hrv, ref: { v: m.avg.hrv, label: isNum(m.avg.hrv) ? `avg ${n0(m.avg.hrv)}` : "" }, aria: "Heart-rate variability" },
-      strain: { kind: "bar", vals: R.map((r) => r.strainPct), color: C.strain, zero: true, ref: { v: 100, label: "target" }, fmtY: (v) => `${v}%`, aria: "Daily strain as percent of target" },
+      sleep: { kind: "bar", vals: R.map(h), color: Cx.sleep, zero: true, line2: { vals: R.map((r) => (isNum(r.needMin) ? r.needMin / 60 : null)), color: Cx.ink2, dash: true }, fmtY: (v) => `${v}h`, aria: "Hours asleep each night, with sleep need" },
+      recovery: { kind: "bar", vals: R.map((r) => r.recovery), colorAt: (i) => Cx[R[i].band || bandOf(R[i].recovery)] || Cx.ink2, ticks: [0, 33, 67, 100], fmtY: (v) => `${v}%`, aria: "Daily recovery" },
+      rhr: { kind: "line", vals: R.map((r) => r.rhr), color: Cx.rhr, ref: { v: m.avg.rhr, label: isNum(m.avg.rhr) ? `avg ${n0(m.avg.rhr)}` : "" }, aria: "Resting heart rate" },
+      hrv: { kind: "line", vals: R.map((r) => r.hrv), color: Cx.hrv, ref: { v: m.avg.hrv, label: isNum(m.avg.hrv) ? `avg ${n0(m.avg.hrv)}` : "" }, aria: "Heart-rate variability" },
+      strain: { kind: "bar", vals: R.map((r) => r.strainPct), color: Cx.strain, zero: true, ref: { v: 100, label: "target" }, fmtY: (v) => `${v}%`, aria: "Daily strain as percent of target" },
     };
     if (m.loadRows && m.loadRows.some((x) => x && isNum(x.ctl))) {
-      S.load = { kind: "line", vals: m.loadRows.map((x) => (x && !x.noData && isNum(x.ctl) ? x.ctl : null)), color: C.accent, line2: { vals: m.loadRows.map((x) => (x && !x.noData && isNum(x.atl) ? x.atl : null)), color: C.strain }, aria: "Fitness and fatigue", h: 120 };
+      S.load = { kind: "line", vals: m.loadRows.map((x) => (x && !x.noData && isNum(x.ctl) ? x.ctl : null)), color: Cx.accent, line2: { vals: m.loadRows.map((x) => (x && !x.noData && isNum(x.atl) ? x.atl : null)), color: Cx.strain }, aria: "Fitness and fatigue", h: 120 };
     }
-    if (m.weight) S.weight = { kind: "line", vals: R.map((r) => r.weight), color: C.weight, fmtY: (v) => n1(v), aria: "Weight", h: 120 };
+    if (m.weight) S.weight = { kind: "line", vals: R.map((r) => r.weight), color: Cx.weight, fmtY: (v) => n1(v), aria: "Weight", h: 120 };
     return S;
   }
 
@@ -22943,6 +23409,36 @@ button.glh-card:focus-visible{outline:2px solid var(--accent);outline-offset:2px
 
     const foot = `<footer class="shr-foot"><span>Cadence · ${esc(monthName(m.key))}</span><span>Estimates from wearable data. Not medical advice.</span></footer>`;
     return `<article class="shr-report${print ? " shr-paper" : ""}" aria-label="Monthly report, ${esc(monthName(m.key))}">${head}${summary}${sleepS}${recS}${heartS}${fitS}${trainS}${recsS}${weightS}${foot}</article>`;
+  }
+
+  /* the 8 summary tiles as data (for the PDF) */
+  function tileData(m) {
+    const a = m.avg, pa = m.prev ? m.prev.avg : {};
+    const dl = (cur, prev, dp, unit, goodUp) => delta(cur, prev, dp, unit, goodUp, m.prevName) || { text: "", tone: "" };
+    const T = (label, value, unit, d, fallback) => ({ label, value: String(value), unit, sub: (d && d.text) || fallback, tone: (d && d.tone) || "" });
+    return [
+      T("Recovery", n0(a.recovery), isNum(a.recovery) ? "%" : "", dl(a.recovery, pa.recovery, 0, " pts", true), "daily average"),
+      T("Sleep", hm(a.sleepMin), "", dl(a.sleepMin, pa.sleepMin, 0, "m", true), "a night"),
+      T("Resting HR", n0(a.rhr), isNum(a.rhr) ? "bpm" : "", dl(a.rhr, pa.rhr, 0, "", false), "average"),
+      T("HRV", n0(a.hrv), isNum(a.hrv) ? "ms" : "", dl(a.hrv, pa.hrv, 0, "", true), "average"),
+      T("Strain", isNum(a.strainPct) ? n0(a.strainPct) : DASH, isNum(a.strainPct) ? "%" : "", { text: (dl(a.strainPct, pa.strainPct, 0, " pts", null) || {}).text, tone: "" }, "of target, a day"),
+      T("Workouts", n0(m.workouts.n), "", null, m.workouts.n ? `${hm(m.workouts.min)} in total` : "none logged"),
+      T("Steps", kfmt(a.steps), "", dl(a.steps, pa.steps, 0, "", true), "a day"),
+      T("VO2max", m.vo2 && isNum(m.vo2.value) ? n1(m.vo2.value) : DASH, m.vo2 && isNum(m.vo2.value) ? "ml/kg/min" : "", null, m.vo2 && m.vo2.norm && m.vo2.norm.category ? m.vo2.norm.category : "estimate"),
+    ].map((t) => ({ ...t, sub: String(t.sub || "").replace(/&amp;/g, "&") }));
+  }
+  const PDF_PAL = { green: "#14a44d", yellow: "#d9a300", red: "#dc2f45", sleep: "#5b87ad", strain: "#0a7fd0", hrv: "#3a7fc2", rhr: "#cf3a55", ink2: "#3f4650", accent: "#0a9a6c", weight: "#7a5bd0" };
+  function pdfBytes(key) {
+    const m = monthModel(key);
+    const today = App.todayStr();
+    return window.CadenceReportPdf.build(m, {
+      monthName: monthName(m.key),
+      period: `${+m.start.slice(8)}–${dShort(m.end)} ${m.start.slice(0, 4)} · ${plural(m.dataDays, "day")} with data${m.ongoing ? " · month in progress" : ""} · made ${dShort(today)}`,
+      tiles: tileData(m),
+      specs: chartSpecs(m, PDF_PAL),
+      hm,
+      dShort,
+    });
   }
 
   function mountCharts(rootEl) {
@@ -23825,7 +24321,7 @@ button.glh-card:focus-visible{outline:2px solid var(--accent);outline-offset:2px
           <button type="button" class="btn small ghost shr-nav" data-action="shr-month" data-v="${esc(months[i + 1] || "")}" ${i < months.length - 1 ? "" : "disabled"} aria-label="Later month">›</button>
         </div>
         <button type="button" class="btn primary shr-pdf" data-action="shr-print"><span>Save as PDF</span></button>
-        <p class="shr-hint">${ios ? "On iPhone: tap Save as PDF, then Share (or pinch out on the preview) and choose Save to Files." : "Choose <b>Save as PDF</b> as the printer. The report prints on white A4 paper."}</p>
+        <p class="shr-hint">${ios ? "Makes an A4 PDF and opens the share sheet: choose Save to Files, WhatsApp or Mail." : "Makes an A4 PDF file of this month's report."} <button type="button" class="shr-printlink" data-action="shr-print-dialog">Print instead</button></p>
       </section>
       <div class="shr-paperwrap">${reportHtml(m)}</div>`;
   }
@@ -23930,7 +24426,8 @@ button.glh-card:focus-visible{outline:2px solid var(--accent);outline-offset:2px
 .shr .shr-sel{flex:1;min-width:0}
 .shr select{width:100%;min-height:44px;border-radius:12px;border:1px solid transparent;background:var(--field);color:var(--foreground);font:inherit;font-weight:600;padding:0 12px;text-align:center}
 .shr .shr-pdf{min-height:48px;display:inline-flex;align-items:center;justify-content:center;gap:8px;width:100%}
-.shr .shr-hint{font-size:var(--fs-s,13px);color:var(--muted);line-height:1.45}
+.shr .shr-printlink{display:inline-flex;align-items:center;min-height:44px;min-width:44px;background:none;border:0;padding:0 6px;margin:-12px 0;font:inherit;color:var(--accent);text-decoration:underline;cursor:pointer}
+.shr-hint{font-size:var(--fs-s,13px);color:var(--muted);line-height:1.45}
 .shr .shr-hint b{color:var(--foreground-secondary)}
 .shr .shr-center{text-align:center;padding:0 8px}
 .shr .shr-empty{display:flex;flex-direction:column;align-items:center;gap:8px;text-align:center;padding:24px 12px}
@@ -24117,18 +24614,44 @@ html[data-theme="blush"] .shr .shr-canvas-wrap{box-shadow:0 2px 6px rgba(110,36,
       ST.month = el.dataset.v;
       App.rerender();
     });
-    App.on("shr-print", async () => {
+    let pdfBusy = false;
+    App.on("shr-print", async (el) => {
+      if (pdfBusy) return;
+      if (!window.CadenceReportPdf) return App.toast && App.toast("PDF maker didn't load. Reload the page and try again.");
+      pdfBusy = true;
+      const btn = el && el.closest ? el.closest("button") : null;
+      const label = btn && btn.querySelector("span");
+      const old = label ? label.textContent : "";
+      if (btn) btn.disabled = true;
+      if (label) label.textContent = "Making your PDF…";
+      try {
+        await new Promise((r) => setTimeout(r, 30)); // let the label paint
+        const bytes = pdfBytes(ST.month);
+        const name = `Cadence report ${monthName(ST.month)}.pdf`;
+        const how = await window.CadenceReportPdf.deliver(bytes, name);
+        if (App.toast) {
+          if (how === "downloaded") App.toast("PDF saved to your downloads");
+          else if (how === "opened") App.toast("PDF opened in a new tab");
+          else if (how === "failed") App.toast("This browser blocked the download. Try Print instead.");
+        }
+      } catch (e) {
+        console.error(e);
+        App.toast && App.toast("Couldn't make the PDF. Try again.");
+      } finally {
+        pdfBusy = false;
+        if (btn) btn.disabled = false;
+        if (label) label.textContent = old || "Save as PDF";
+      }
+    });
+    App.on("shr-print-dialog", async () => {
       try {
         await waitFonts();
         preparePrint(ST.month);
-        // let layout settle so the SVGs are laid out before the print snapshot
         await new Promise((r) => setTimeout(r, 60));
         window.print();
       } catch (e) {
-        console.error(e);
         App.toast && App.toast("Couldn't open the print dialog. Use your browser's Print menu.");
       } finally {
-        // afterprint also cleans up; some mobile browsers return from print() before printing
         setTimeout(() => { if (!window.matchMedia || !window.matchMedia("print").matches) cleanupPrint(); }, 1500);
       }
     });
